@@ -41,7 +41,10 @@ mod tests {
     #[test]
     fn round_trip() {
         let secret = Secret::generate();
-        let code = Code::new("https://foo.trycloudflare.com".parse().unwrap(), secret.clone());
+        let code = Code::new(
+            "https://foo.trycloudflare.com".parse().unwrap(),
+            secret.clone(),
+        );
         let s = code.to_string();
         assert!(s.starts_with("https://foo.trycloudflare.com"));
         assert!(s.contains('#'));

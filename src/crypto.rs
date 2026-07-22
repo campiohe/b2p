@@ -60,7 +60,13 @@ fn make_nonce(domain: Domain, index: u64) -> XNonce {
 pub fn seal(key: &[u8; 32], domain: Domain, index: u64, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .encrypt(&make_nonce(domain, index), Payload { msg: plaintext, aad })
+        .encrypt(
+            &make_nonce(domain, index),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("encryption is infallible for in-memory buffers")
 }
 
@@ -73,7 +79,13 @@ pub fn open(
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(&make_nonce(domain, index), Payload { msg: ciphertext, aad })
+        .decrypt(
+            &make_nonce(domain, index),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError)
 }
 

@@ -15,7 +15,14 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn build_manifest(source: &Source) -> anyhow::Result<Manifest> {
     Ok(match source {
-        Source::Blob { kind, name, entries, total_size, transfer_id, .. } => Manifest {
+        Source::Blob {
+            kind,
+            name,
+            entries,
+            total_size,
+            transfer_id,
+            ..
+        } => Manifest {
             version: PROTOCOL_VERSION,
             transfer_id: transfer_id.clone(),
             kind: *kind,
@@ -25,7 +32,10 @@ pub fn build_manifest(source: &Source) -> anyhow::Result<Manifest> {
             chunk_size: CHUNK_SIZE,
             text: None,
         },
-        Source::Text { content, transfer_id } => Manifest {
+        Source::Text {
+            content,
+            transfer_id,
+        } => Manifest {
             version: PROTOCOL_VERSION,
             transfer_id: transfer_id.clone(),
             kind: Kind::Text,
@@ -104,9 +114,12 @@ pub async fn send(
     }
 
     let (path, total_size, tid) = match &source {
-        Source::Blob { path, total_size, transfer_id, .. } => {
-            (path.clone(), *total_size, transfer_id.clone())
-        }
+        Source::Blob {
+            path,
+            total_size,
+            transfer_id,
+            ..
+        } => (path.clone(), *total_size, transfer_id.clone()),
         Source::Text { .. } => unreachable!("text completes at manifest time"),
     };
 
@@ -114,7 +127,11 @@ pub async fn send(
     let have: std::collections::HashSet<u64> = ack.have.into_iter().collect();
     if let Some(pb) = &progress {
         pb.set_length(total_size);
-        pb.inc(have.iter().map(|i| CHUNK_SIZE.min(total_size - i * CHUNK_SIZE)).sum());
+        pb.inc(
+            have.iter()
+                .map(|i| CHUNK_SIZE.min(total_size - i * CHUNK_SIZE))
+                .sum(),
+        );
     }
 
     let missing: Vec<u64> = (0..total_chunks).filter(|i| !have.contains(i)).collect();
@@ -149,7 +166,12 @@ pub async fn send(
         move || blake3_file(&path)
     })
     .await??;
-    let commit_body = seal_json(&key, Domain::Commit, tid.as_bytes(), &Commit { blake3_hex: hash });
+    let commit_body = seal_json(
+        &key,
+        Domain::Commit,
+        tid.as_bytes(),
+        &Commit { blake3_hex: hash },
+    );
     let ack: CommitAck = client
         .post(format!("{base}/v1/commit"))
         .bearer_auth(&token)
@@ -160,7 +182,10 @@ pub async fn send(
         .json()
         .await?;
     if !ack.ok {
-        bail!("receiver failed to finalize: {}", ack.error.unwrap_or_default());
+        bail!(
+            "receiver failed to finalize: {}",
+            ack.error.unwrap_or_default()
+        );
     }
     drop(source); // keeps tar spool alive until here
     Ok("transfer complete".to_string())
@@ -187,13 +212,17 @@ async fn upload_with_retry(
             Ok(r) if r.status() == 401 => bail!("auth rejected (HTTP 401) mid-transfer"),
             Ok(r) => {
                 if attempt == CHUNK_ATTEMPTS {
-                    bail!("chunk {index}: HTTP {} after {CHUNK_ATTEMPTS} attempts", r.status());
+                    bail!(
+                        "chunk {index}: HTTP {} after {CHUNK_ATTEMPTS} attempts",
+                        r.status()
+                    );
                 }
             }
             Err(e) => {
                 if attempt == CHUNK_ATTEMPTS {
-                    return Err(e)
-                        .context(format!("chunk {index} failed after {CHUNK_ATTEMPTS} attempts"));
+                    return Err(e).context(format!(
+                        "chunk {index} failed after {CHUNK_ATTEMPTS} attempts"
+                    ));
                 }
             }
         }
@@ -226,7 +255,9 @@ mod tests {
         .await
         .unwrap();
         let code = Code::new(
-            format!("http://127.0.0.1:{}", handles.port).parse().unwrap(),
+            format!("http://127.0.0.1:{}", handles.port)
+                .parse()
+                .unwrap(),
             secret,
         );
         (code, out, handles)
@@ -271,9 +302,9 @@ mod tests {
         // First: upload only chunk 0 by hand, simulating an interrupted transfer.
         let source = archive::prepare(&[src_dir.path().join("big.bin")]).unwrap();
         let (tid, path) = match &source {
-            archive::Source::Blob { transfer_id, path, .. } => {
-                (transfer_id.clone(), path.clone())
-            }
+            archive::Source::Blob {
+                transfer_id, path, ..
+            } => (transfer_id.clone(), path.clone()),
             _ => unreachable!(),
         };
         let manifest = build_manifest(&source).unwrap();
@@ -298,7 +329,13 @@ mod tests {
             .unwrap();
         assert!(ack.accepted);
         let chunk0 = read_chunk(&path, 0, manifest.chunk_size, manifest.total_size).unwrap();
-        let ct = crate::crypto::seal(&key, crate::crypto::Domain::Data, 0, tid.as_bytes(), &chunk0);
+        let ct = crate::crypto::seal(
+            &key,
+            crate::crypto::Domain::Data,
+            0,
+            tid.as_bytes(),
+            &chunk0,
+        );
         client
             .put(format!("{base}/v1/chunk/0"))
             .bearer_auth(&token)
@@ -321,6 +358,9 @@ mod tests {
         std::fs::write(src_dir.path().join("f.txt"), "x").unwrap();
         let source = archive::prepare(&[src_dir.path().join("f.txt")]).unwrap();
         let err = send(&bad, source, None).await.unwrap_err().to_string();
-        assert!(err.contains("401") || err.to_lowercase().contains("auth"), "{err}");
+        assert!(
+            err.contains("401") || err.to_lowercase().contains("auth"),
+            "{err}"
+        );
     }
 }

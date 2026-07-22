@@ -83,7 +83,9 @@ pub async fn start(cfg: ServerCfg, bind_all: bool) -> anyhow::Result<Handles> {
         .route("/v1/status", get(handle_status))
         .route("/v1/commit", post(handle_commit))
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw))
-        .layer(DefaultBodyLimit::max((crate::crypto::CHUNK_SIZE + 4096) as usize))
+        .layer(DefaultBodyLimit::max(
+            (crate::crypto::CHUNK_SIZE + 4096) as usize,
+        ))
         .with_state(app);
 
     let host = if bind_all { "0.0.0.0" } else { "127.0.0.1" };
@@ -97,7 +99,13 @@ pub async fn start(cfg: ServerCfg, bind_all: bool) -> anyhow::Result<Handles> {
             .await;
     });
 
-    Ok(Handles { port, accept_rx, events_rx, shutdown, task })
+    Ok(Handles {
+        port,
+        accept_rx,
+        events_rx,
+        shutdown,
+        task,
+    })
 }
 
 async fn auth_mw(
@@ -114,9 +122,9 @@ async fn auth_mw(
     if blake3::hash(provided.as_bytes()) != app.token_hash {
         let fails = app.auth_failures.fetch_add(1, Ordering::SeqCst) + 1;
         if fails >= MAX_AUTH_FAILURES {
-            let _ = app
-                .events_tx
-                .send(Event::Failed("too many bad auth attempts — shutting down".into()));
+            let _ = app.events_tx.send(Event::Failed(
+                "too many bad auth attempts — shutting down".into(),
+            ));
             app.shutdown.cancel();
         }
         return Err(StatusCode::UNAUTHORIZED);
@@ -137,8 +145,12 @@ async fn handle_manifest(State(app): State<Arc<App>>, body: Bytes) -> Response {
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     if manifest.version != PROTOCOL_VERSION {
-        return Json(ManifestAck { accepted: false, complete: false, have: vec![] })
-            .into_response();
+        return Json(ManifestAck {
+            accepted: false,
+            complete: false,
+            have: vec![],
+        })
+        .into_response();
     }
 
     let name = safe_name(&manifest.name);
@@ -169,15 +181,24 @@ async fn handle_manifest(State(app): State<Arc<App>>, body: Bytes) -> Response {
         !(dest_exists && manifest.kind == Kind::File && !app.cfg.overwrite)
     } else {
         let (tx, rx) = oneshot::channel();
-        if app.accept_tx.send(AcceptRequest { summary, reply: tx }).await.is_err() {
+        if app
+            .accept_tx
+            .send(AcceptRequest { summary, reply: tx })
+            .await
+            .is_err()
+        {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         rx.await.unwrap_or(false)
     };
 
     if !accepted {
-        return Json(ManifestAck { accepted: false, complete: false, have: vec![] })
-            .into_response();
+        return Json(ManifestAck {
+            accepted: false,
+            complete: false,
+            have: vec![],
+        })
+        .into_response();
     }
 
     if manifest.kind == Kind::Text {
@@ -189,8 +210,12 @@ async fn handle_manifest(State(app): State<Arc<App>>, body: Bytes) -> Response {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             shutdown.cancel();
         });
-        return Json(ManifestAck { accepted: true, complete: true, have: vec![] })
-            .into_response();
+        return Json(ManifestAck {
+            accepted: true,
+            complete: true,
+            have: vec![],
+        })
+        .into_response();
     }
 
     let store = match Store::open_or_create(
@@ -202,7 +227,9 @@ async fn handle_manifest(State(app): State<Arc<App>>, body: Bytes) -> Response {
     ) {
         Ok(s) => s,
         Err(e) => {
-            let _ = app.events_tx.send(Event::Failed(format!("cannot open store: {e}")));
+            let _ = app
+                .events_tx
+                .send(Event::Failed(format!("cannot open store: {e}")));
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -212,7 +239,12 @@ async fn handle_manifest(State(app): State<Arc<App>>, body: Bytes) -> Response {
         total_size: manifest.total_size,
     });
     *app.transfer.lock().await = Some(ActiveTransfer { manifest, store });
-    Json(ManifestAck { accepted: true, complete: false, have }).into_response()
+    Json(ManifestAck {
+        accepted: true,
+        complete: false,
+        have,
+    })
+    .into_response()
 }
 
 async fn handle_chunk(
@@ -231,7 +263,9 @@ async fn handle_chunk(
     };
     match active.store.write_chunk(index, &plaintext) {
         Ok(()) => {
-            let _ = app.events_tx.send(Event::Progress { bytes: plaintext.len() as u64 });
+            let _ = app.events_tx.send(Event::Progress {
+                bytes: plaintext.len() as u64,
+            });
             StatusCode::OK.into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -241,7 +275,10 @@ async fn handle_chunk(
 async fn handle_status(State(app): State<Arc<App>>) -> Response {
     let guard = app.transfer.lock().await;
     match guard.as_ref() {
-        Some(active) => Json(StatusResp { have: active.store.have() }).into_response(),
+        Some(active) => Json(StatusResp {
+            have: active.store.have(),
+        })
+        .into_response(),
         None => StatusCode::CONFLICT.into_response(),
     }
 }
@@ -269,11 +306,17 @@ async fn handle_commit(State(app): State<Arc<App>>, body: Bytes) -> Response {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 shutdown.cancel();
             });
-            CommitAck { ok: true, error: None }
+            CommitAck {
+                ok: true,
+                error: None,
+            }
         }
         Err(e) => {
             let _ = app.events_tx.send(Event::Failed(e.to_string()));
-            CommitAck { ok: false, error: Some(e.to_string()) }
+            CommitAck {
+                ok: false,
+                error: Some(e.to_string()),
+            }
         }
     };
     Json(ack).into_response()
@@ -301,7 +344,10 @@ fn finalize(app: &App, active: ActiveTransfer, commit: &Commit) -> anyhow::Resul
         Kind::Tar => {
             unpack_tar(active.store.data_path(), &app.cfg.out_dir)?;
             active.store.cleanup()?;
-            Ok(format!("unpacked archive into {}", app.cfg.out_dir.display()))
+            Ok(format!(
+                "unpacked archive into {}",
+                app.cfg.out_dir.display()
+            ))
         }
         Kind::Text => unreachable!("text transfers complete at manifest time"),
     }
@@ -351,7 +397,10 @@ mod tests {
             transfer_id: tid.into(),
             kind: Kind::File,
             name: "out.bin".into(),
-            entries: vec![Entry { path: "out.bin".into(), size: total }],
+            entries: vec![Entry {
+                path: "out.bin".into(),
+                size: total,
+            }],
             total_size: total,
             chunk_size: CHUNK_SIZE,
             text: None,
@@ -411,7 +460,9 @@ mod tests {
             .unwrap();
         assert!(r.status().is_success());
 
-        let commit = Commit { blake3_hex: blake3::hash(&content).to_hex().to_string() };
+        let commit = Commit {
+            blake3_hex: blake3::hash(&content).to_hex().to_string(),
+        };
         let body = seal_json(&c.key, Domain::Commit, tid.as_bytes(), &commit);
         let ack: CommitAck = c
             .client
@@ -425,7 +476,10 @@ mod tests {
             .await
             .unwrap();
         assert!(ack.ok, "{:?}", ack.error);
-        assert_eq!(std::fs::read(c.out.path().join("out.bin")).unwrap(), content);
+        assert_eq!(
+            std::fs::read(c.out.path().join("out.bin")).unwrap(),
+            content
+        );
     }
 
     #[tokio::test]
@@ -470,7 +524,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let commit = Commit { blake3_hex: blake3::hash(&content).to_hex().to_string() };
+        let commit = Commit {
+            blake3_hex: blake3::hash(&content).to_hex().to_string(),
+        };
         let body = seal_json(&c.key, Domain::Commit, tid.as_bytes(), &commit);
         c.client
             .post(format!("{}/v1/commit", c.base))
@@ -497,7 +553,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let commit = Commit { blake3_hex: "00".repeat(32) };
+        let commit = Commit {
+            blake3_hex: "00".repeat(32),
+        };
         let body = seal_json(&c.key, Domain::Commit, tid.as_bytes(), &commit);
         let ack: CommitAck = c
             .client

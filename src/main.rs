@@ -8,7 +8,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "b2p", about = "Encrypted file transfer over plain HTTPS uploads")]
+#[command(
+    name = "b2p",
+    about = "Encrypted file transfer over plain HTTPS uploads"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -54,7 +57,12 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     match Cli::parse().cmd {
-        Cmd::Receive { out, direct, yes, overwrite } => receive(out, direct, yes, overwrite).await,
+        Cmd::Receive {
+            out,
+            direct,
+            yes,
+            overwrite,
+        } => receive(out, direct, yes, overwrite).await,
         Cmd::Send { code, paths, text } => do_send(code, paths, text).await,
     }
 }

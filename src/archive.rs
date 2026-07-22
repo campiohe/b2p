@@ -32,8 +32,8 @@ impl Source {
 fn collect_files(paths: &[PathBuf]) -> anyhow::Result<Vec<(String, PathBuf, u64, u64)>> {
     let mut files = Vec::new();
     for input in paths {
-        let meta = std::fs::metadata(input)
-            .with_context(|| format!("cannot read {}", input.display()))?;
+        let meta =
+            std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?;
         let base_name = input
             .file_name()
             .context("path has no file name")?
@@ -47,7 +47,11 @@ fn collect_files(paths: &[PathBuf]) -> anyhow::Result<Vec<(String, PathBuf, u64,
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                let rel = entry.path().strip_prefix(input)?.to_string_lossy().replace('\\', "/");
+                let rel = entry
+                    .path()
+                    .strip_prefix(input)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 let m = entry.metadata()?;
                 files.push((
                     format!("{base_name}/{rel}"),
@@ -96,7 +100,10 @@ pub fn prepare(paths: &[PathBuf]) -> anyhow::Result<Source> {
     let transfer_id = fingerprint(&files);
     let entries: Vec<Entry> = files
         .iter()
-        .map(|(rel, _, size, _)| Entry { path: rel.clone(), size: *size })
+        .map(|(rel, _, size, _)| Entry {
+            path: rel.clone(),
+            size: *size,
+        })
         .collect();
 
     // Exactly one regular-file argument: send it raw, no tar.
@@ -143,7 +150,9 @@ pub fn prepare_text(content: &str) -> Source {
 
 pub fn unpack_tar(tar_path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(File::open(tar_path)?);
-    archive.unpack(out_dir).context("unpacking received archive")?;
+    archive
+        .unpack(out_dir)
+        .context("unpacking received archive")?;
     Ok(())
 }
 
@@ -165,7 +174,14 @@ mod tests {
         write(dir.path(), "hello.txt", "hi there");
         let src = prepare(&[dir.path().join("hello.txt")]).unwrap();
         match src {
-            Source::Blob { kind, name, total_size, entries, spool, .. } => {
+            Source::Blob {
+                kind,
+                name,
+                total_size,
+                entries,
+                spool,
+                ..
+            } => {
                 assert_eq!(kind, Kind::File);
                 assert_eq!(name, "hello.txt");
                 assert_eq!(total_size, 8);
@@ -183,7 +199,13 @@ mod tests {
         write(dir.path(), "proj/sub/b.txt", "BBBB");
         let src = prepare(&[dir.path().join("proj")]).unwrap();
         let (path, total_size) = match &src {
-            Source::Blob { kind, path, total_size, entries, .. } => {
+            Source::Blob {
+                kind,
+                path,
+                total_size,
+                entries,
+                ..
+            } => {
                 assert_eq!(*kind, Kind::Tar);
                 assert_eq!(entries.len(), 2);
                 (path.clone(), *total_size)
@@ -194,8 +216,14 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         unpack_tar(&path, out.path()).unwrap();
-        assert_eq!(fs::read_to_string(out.path().join("proj/a.txt")).unwrap(), "AAA");
-        assert_eq!(fs::read_to_string(out.path().join("proj/sub/b.txt")).unwrap(), "BBBB");
+        assert_eq!(
+            fs::read_to_string(out.path().join("proj/a.txt")).unwrap(),
+            "AAA"
+        );
+        assert_eq!(
+            fs::read_to_string(out.path().join("proj/sub/b.txt")).unwrap(),
+            "BBBB"
+        );
     }
 
     #[test]
@@ -215,7 +243,10 @@ mod tests {
     fn text_source() {
         let s = prepare_text("a secret note");
         match &s {
-            Source::Text { content, transfer_id } => {
+            Source::Text {
+                content,
+                transfer_id,
+            } => {
                 assert_eq!(content, "a secret note");
                 assert_eq!(transfer_id.len(), 32);
             }

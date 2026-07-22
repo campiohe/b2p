@@ -56,7 +56,13 @@ impl Store {
             .open(&data_path)?;
         file.set_len(total_size)?;
 
-        let store = Store { dir, data_path, state_path, file, state };
+        let store = Store {
+            dir,
+            data_path,
+            state_path,
+            file,
+            state,
+        };
         store.persist_state()?;
         Ok(store)
     }
@@ -94,7 +100,8 @@ impl Store {
                 self.expected_len(index)
             );
         }
-        self.file.seek(SeekFrom::Start(index * self.state.chunk_size))?;
+        self.file
+            .seek(SeekFrom::Start(index * self.state.chunk_size))?;
         self.file.write_all(plaintext)?;
         self.file.flush()?;
         self.state.have.insert(index);

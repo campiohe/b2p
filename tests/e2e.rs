@@ -19,7 +19,9 @@ async fn spawn_receiver(out: &Path) -> (Code, Handles) {
     .await
     .unwrap();
     let code = Code::new(
-        format!("http://127.0.0.1:{}", handles.port).parse().unwrap(),
+        format!("http://127.0.0.1:{}", handles.port)
+            .parse()
+            .unwrap(),
         secret,
     );
     (code, handles)
@@ -43,12 +45,18 @@ async fn folder_round_trip() {
     let source = archive::prepare(&[src.path().join("proj")]).unwrap();
     b2p::send::send(&code, source, None).await.unwrap();
 
-    assert_eq!(fs::read(out.path().join("proj/readme.md")).unwrap(), b"# hi");
+    assert_eq!(
+        fs::read(out.path().join("proj/readme.md")).unwrap(),
+        b"# hi"
+    );
     assert_eq!(
         fs::read(out.path().join("proj/data/big.bin")).unwrap(),
         vec![42u8; 5_000_000]
     );
-    assert_eq!(fs::read(out.path().join("proj/data/nested/deep.txt")).unwrap(), b"deep");
+    assert_eq!(
+        fs::read(out.path().join("proj/data/nested/deep.txt")).unwrap(),
+        b"deep"
+    );
     assert!(!out.path().join("b2p-bundle.tar.b2p-partial").exists());
 }
 
@@ -126,7 +134,13 @@ async fn interrupted_then_resumed_transfer() {
                 manifest.total_size,
             )
             .unwrap();
-            let ct = seal(&key, Domain::Data, index, manifest.transfer_id.as_bytes(), &plain);
+            let ct = seal(
+                &key,
+                Domain::Data,
+                index,
+                manifest.transfer_id.as_bytes(),
+                &plain,
+            );
             client
                 .put(format!("{base}/v1/chunk/{index}"))
                 .bearer_auth(&token)

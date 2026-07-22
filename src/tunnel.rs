@@ -58,11 +58,15 @@ pub(crate) fn platform_key() -> Option<&'static str> {
 }
 
 fn binary_path() -> anyhow::Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "b2p")
-        .context("cannot determine data directory")?;
+    let dirs =
+        directories::ProjectDirs::from("", "", "b2p").context("cannot determine data directory")?;
     let bin_dir = dirs.data_dir().join("bin");
     std::fs::create_dir_all(&bin_dir)?;
-    let name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+    let name = if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    };
     Ok(bin_dir.join(format!("{name}-{CLOUDFLARED_VERSION}")))
 }
 
@@ -81,7 +85,11 @@ async fn ensure_binary() -> anyhow::Result<PathBuf> {
     let url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{file}"
     );
-    let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+    let bytes = reqwest::get(&url)
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
 
     let digest = hex::encode(Sha256::digest(&bytes));
     if digest != *expected_sha {
@@ -94,7 +102,12 @@ async fn ensure_binary() -> anyhow::Result<PathBuf> {
         let mut out = Vec::new();
         for entry in ar.entries()? {
             let mut entry = entry?;
-            if entry.path()?.file_name().map(|n| n == "cloudflared").unwrap_or(false) {
+            if entry
+                .path()?
+                .file_name()
+                .map(|n| n == "cloudflared")
+                .unwrap_or(false)
+            {
                 std::io::copy(&mut entry, &mut out)?;
                 break;
             }
@@ -150,7 +163,10 @@ pub async fn start_cloudflared(port: u16) -> anyhow::Result<TunnelHandle> {
          try --direct on a LAN, or run the receiver on a less restricted network",
     )?;
 
-    Ok(TunnelHandle { url, child: Some(child) })
+    Ok(TunnelHandle {
+        url,
+        child: Some(child),
+    })
 }
 
 #[cfg(test)]
@@ -159,9 +175,13 @@ mod tests {
 
     #[test]
     fn parses_tunnel_url_from_cloudflared_banner() {
-        let line = "2026-07-22T10:00:00Z INF |  https://tall-lion-radio-carpet.trycloudflare.com  |";
+        let line =
+            "2026-07-22T10:00:00Z INF |  https://tall-lion-radio-carpet.trycloudflare.com  |";
         let url = parse_tunnel_url(line).unwrap();
-        assert_eq!(url.as_str(), "https://tall-lion-radio-carpet.trycloudflare.com/");
+        assert_eq!(
+            url.as_str(),
+            "https://tall-lion-radio-carpet.trycloudflare.com/"
+        );
         assert!(parse_tunnel_url("no url here").is_none());
         assert!(parse_tunnel_url("https://api.trycloudflare.com is not a tunnel").is_some());
     }
@@ -175,8 +195,13 @@ mod tests {
 
     #[test]
     fn current_platform_has_a_pin() {
-        assert!(platform_key().is_some(), "no cloudflared pin for this platform");
+        assert!(
+            platform_key().is_some(),
+            "no cloudflared pin for this platform"
+        );
         let key = platform_key().unwrap();
-        assert!(crate::cloudflared_pins::PINS.iter().any(|(k, _, _)| *k == key));
+        assert!(crate::cloudflared_pins::PINS
+            .iter()
+            .any(|(k, _, _)| *k == key));
     }
 }

@@ -84,7 +84,10 @@ mod tests {
             transfer_id: "ab".repeat(16),
             kind: Kind::File,
             name: "report.pdf".into(),
-            entries: vec![Entry { path: "report.pdf".into(), size: 9_000_000 }],
+            entries: vec![Entry {
+                path: "report.pdf".into(),
+                size: 9_000_000,
+            }],
             total_size: 9_000_000,
             chunk_size: 4 * 1024 * 1024,
             text: None,
@@ -102,7 +105,12 @@ mod tests {
 
     #[test]
     fn open_json_rejects_wrong_key() {
-        let ct = seal_json(&Secret([1u8; 16]).data_key(), Domain::Manifest, b"", &sample_manifest());
+        let ct = seal_json(
+            &Secret([1u8; 16]).data_key(),
+            Domain::Manifest,
+            b"",
+            &sample_manifest(),
+        );
         let r: anyhow::Result<Manifest> =
             open_json(&Secret([2u8; 16]).data_key(), Domain::Manifest, b"", &ct);
         assert!(r.is_err());
