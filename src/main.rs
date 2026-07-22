@@ -50,6 +50,11 @@ enum Cmd {
         #[arg(long, conflicts_with = "paths")]
         text: Option<String>,
     },
+    /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
+    Doctor {
+        /// A b2p code, URL, or hostname to test (default: the tunnel domain)
+        target: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -73,6 +78,16 @@ async fn run() -> anyhow::Result<()> {
             overwrite,
         } => receive(out, direct, yes, overwrite, &tls).await,
         Cmd::Send { code, paths, text } => do_send(code, paths, text, &tls).await,
+        Cmd::Doctor { target } => {
+            let target_host = target.as_deref().map(parse_target).transpose()?;
+            let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
+                target_host,
+                cafile: cli.cafile.clone(),
+            })
+            .await;
+            println!("{report}");
+            Ok(())
+        }
     }
 }
 
@@ -178,4 +193,47 @@ async fn do_send(
     }
     eprintln!("Done: {desc}");
     Ok(())
+}
+
+fn parse_target(s: &str) -> anyhow::Result<String> {
+    let host = if s.contains('#') {
+        Code::parse(s)?
+            .base_url
+            .host_str()
+            .context("code URL has no host")?
+            .to_string()
+    } else if s.contains("://") {
+        url::Url::parse(s)
+            .context("invalid URL")?
+            .host_str()
+            .context("URL has no host")?
+            .to_string()
+    } else {
+        s.to_string()
+    };
+    Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_target_accepts_code_url_and_host() {
+        let secret = b2p::crypto::Secret::generate();
+        let code = b2p::code::Code::new(
+            "https://tall-lion.trycloudflare.com".parse().unwrap(),
+            secret,
+        );
+        assert_eq!(
+            parse_target(&code.to_string()).unwrap(),
+            "tall-lion.trycloudflare.com"
+        );
+        assert_eq!(
+            parse_target("https://example.com/x").unwrap(),
+            "example.com"
+        );
+        assert_eq!(parse_target("example.com").unwrap(), "example.com");
+        assert!(parse_target("http://#nope").is_err());
+    }
 }
