@@ -43,9 +43,12 @@ workflow lands.
 | Runner | `target` | Asset name |
 |---|---|---|
 | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `b2p-linux-x86_64.tar.gz` |
-| `macos-13` | `x86_64-apple-darwin` | `b2p-macos-x86_64.tar.gz` |
 | `macos-14` | `aarch64-apple-darwin` | `b2p-macos-arm64.tar.gz` |
 | `windows-latest` | `x86_64-pc-windows-msvc` | `b2p-windows-x86_64.zip` |
+
+Intel macOS (`x86_64-apple-darwin` on `macos-13`) is intentionally omitted:
+GitHub-hosted Intel-mac runners are scarce and queue for several minutes,
+dominating release wall-clock, and Apple Silicon covers the current Mac base.
 
 Each leg:
 - checkout, `dtolnay/rust-toolchain@stable` with `targets: <target>`, `rust-cache`

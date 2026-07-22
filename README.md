@@ -53,7 +53,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy`, and
 
 ## Releases
 
-Prebuilt binaries for Linux, macOS (Intel + Apple Silicon), and Windows are
+Prebuilt binaries for Linux, macOS (Apple Silicon), and Windows are
 attached to each [GitHub Release](https://github.com/campiohe/b2p/releases).
 
 To cut a release:

@@ -21,9 +21,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: b2p-linux-x86_64.tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset: b2p-macos-x86_64.tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
             asset: b2p-macos-arm64.tar.gz
