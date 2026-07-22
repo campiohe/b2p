@@ -242,7 +242,7 @@ v2 is **open and multi-mode by design** (Appendix A): transports and rendezvous 
 What the **core project** ships is scoped, though:
 
 - **Ships:** transports that use *permitted connectivity* (WebRTC/STUN/TURN, LAN, mainstream HTTPS) or *the operator's own infrastructure* (self-hosted relay/rendezvous/TURN, cloud/git backends under the user's own credentials), always E2E-encrypted, and trusting the OS trust store so inspecting proxies pass b2p rather than break it.
-Transports whose function with traffic obfuscation/mimicry, domain fronting, SNI spoofing, blocklist-evasion domain cycling, or DoH used to override a network's DNS policy.
+- **Does not ship:** transports whose function depends on traffic obfuscation/mimicry, domain fronting, SNI spoofing, blocklist-evasion domain cycling, or DoH used to override a network's DNS policy.
 
 ---
 

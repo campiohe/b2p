@@ -57,10 +57,23 @@ pub fn issuer_of(der: &[u8]) -> anyhow::Result<String> {
     Ok(cert.issuer().to_string())
 }
 
+/// Load PEM certificates for use as extra trust roots. Mirrors
+/// `http::load_pem_certs`'s empty-file guard: `rustls_pemfile::certs()`
+/// silently filters out non-certificate PEM items, so a garbage file would
+/// otherwise parse to `Ok(vec![])` here while `http.rs` (which parses the
+/// same bytes via `reqwest::Certificate::from_pem_bundle`) rejects it — the
+/// two loaders must return the same verdict for the same `--cafile`, even
+/// though they build different certificate types and so can't share code.
 pub fn load_pem_roots(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let pem = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut &pem[..]).collect();
-    certs.with_context(|| format!("parsing PEM certificates in {}", path.display()))
+    let certs = certs.with_context(|| format!("parsing PEM certificates in {}", path.display()))?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "no certificates found in {}",
+        path.display()
+    );
+    Ok(certs)
 }
 
 pub async fn probe(
@@ -233,6 +246,29 @@ mod tests {
         let issuer = issuer_of(ck.cert.der()).unwrap();
         assert!(issuer.contains("rcgen"), "{issuer}");
         assert!(issuer_of(b"garbage").is_err());
+    }
+
+    #[test]
+    fn load_pem_roots_rejects_cert_free_pem() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let garbage = dir.path().join("garbage.pem");
+        std::fs::write(&garbage, "not a pem").unwrap();
+        assert!(load_pem_roots(&garbage).is_err());
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(load_pem_roots(&empty).is_err());
+    }
+
+    #[test]
+    fn load_pem_roots_loads_valid_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["x".into()]).unwrap();
+        let path = dir.path().join("valid.pem");
+        std::fs::write(&path, ck.cert.pem()).unwrap();
+        let certs = load_pem_roots(&path).unwrap();
+        assert_eq!(certs.len(), 1);
     }
 
     #[test]

@@ -155,7 +155,8 @@ async fn connect_failure(
     };
     eprintln!("\n{name} layer failed reaching {host}: {chain}");
     eprintln!("hint: {hint}");
-    if !matches!(layer, FailLayer::Other) {
+    let ran_doctor = !matches!(layer, FailLayer::Other);
+    if ran_doctor {
         eprintln!("\nRunning diagnostics (b2p doctor)...\n");
         let report = crate::doctor::run(&crate::doctor::DoctorArgs {
             target_host: Some(host.clone()),
@@ -164,7 +165,17 @@ async fn connect_failure(
         .await;
         eprintln!("{report}");
     }
-    anyhow::anyhow!("{name} failure reaching {host} — see diagnostics above")
+    anyhow::anyhow!("{}", failure_summary(name, &host, ran_doctor))
+}
+
+/// The final error text for `connect_failure`, split out so it's testable
+/// without running the async doctor pass.
+fn failure_summary(name: &str, host: &str, ran_doctor: bool) -> String {
+    if ran_doctor {
+        format!("{name} failure reaching {host} — see diagnostics above")
+    } else {
+        format!("{name} failure reaching {host}")
+    }
 }
 
 pub async fn send(
@@ -473,6 +484,22 @@ mod tests {
             classify_error_text("something odd"),
             FailLayer::Other
         ));
+    }
+
+    #[test]
+    fn failure_summary_mentions_diagnostics_when_doctor_ran() {
+        let msg = failure_summary("DNS", "example.com", true);
+        assert_eq!(
+            msg,
+            "DNS failure reaching example.com — see diagnostics above"
+        );
+    }
+
+    #[test]
+    fn failure_summary_omits_diagnostics_when_doctor_did_not_run() {
+        let msg = failure_summary("transport", "example.com", false);
+        assert_eq!(msg, "transport failure reaching example.com");
+        assert!(!msg.contains("diagnostics"));
     }
 
     #[tokio::test]

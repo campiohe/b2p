@@ -105,6 +105,12 @@ async fn dns_check(host: &str) -> Check {
         outcome,
         detail,
     };
+    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+        return make(
+            Outcome::Ok,
+            format!("{host} is a literal address — DNS not in play"),
+        );
+    }
     match tokio::time::timeout(CHECK_TIMEOUT, tokio::net::lookup_host((host, 443))).await {
         Ok(Ok(addrs)) => {
             let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
@@ -336,6 +342,16 @@ mod tests {
         assert!(text.contains("! tls"), "{text}");
         assert!(text.contains("✗ stun"), "{text}");
         assert!(text.contains("verdict: sample verdict"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dns_check_treats_ip_literal_and_localhost_as_not_dns() {
+        for host in ["127.0.0.1", "localhost"] {
+            let c = dns_check(host).await;
+            assert_eq!(c.outcome, Outcome::Ok, "{}", c.detail);
+            assert!(c.detail.contains("DNS"), "{}", c.detail);
+            assert!(c.detail.contains("not"), "{}", c.detail);
+        }
     }
 
     #[tokio::test]
