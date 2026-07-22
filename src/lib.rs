@@ -2,6 +2,7 @@ pub mod archive;
 pub mod cloudflared_pins;
 pub mod code;
 pub mod crypto;
+pub mod doctor;
 pub mod http;
 pub mod progress;
 pub mod protocol;
