@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod http;
 pub mod progress;
 pub mod protocol;
+pub mod rvcode;
 pub mod send;
 pub mod server;
 pub mod store;
