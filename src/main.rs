@@ -10,6 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "b2p",
+    version,
     about = "Encrypted file transfer over plain HTTPS uploads"
 )]
 struct Cli {
