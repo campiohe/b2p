@@ -70,7 +70,7 @@ fn binary_path() -> anyhow::Result<PathBuf> {
     Ok(bin_dir.join(format!("{name}-{CLOUDFLARED_VERSION}")))
 }
 
-async fn ensure_binary() -> anyhow::Result<PathBuf> {
+async fn ensure_binary(tls: &crate::http::TlsOpts) -> anyhow::Result<PathBuf> {
     let path = binary_path()?;
     if path.exists() {
         return Ok(path);
@@ -85,7 +85,9 @@ async fn ensure_binary() -> anyhow::Result<PathBuf> {
     let url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{file}"
     );
-    let bytes = reqwest::get(&url)
+    let bytes = crate::http::client(tls)?
+        .get(&url)
+        .send()
         .await?
         .error_for_status()?
         .bytes()
@@ -129,8 +131,11 @@ async fn ensure_binary() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-pub async fn start_cloudflared(port: u16) -> anyhow::Result<TunnelHandle> {
-    let bin = ensure_binary().await?;
+pub async fn start_cloudflared(
+    port: u16,
+    tls: &crate::http::TlsOpts,
+) -> anyhow::Result<TunnelHandle> {
+    let bin = ensure_binary(tls).await?;
     let mut child = tokio::process::Command::new(&bin)
         .args([
             "tunnel",

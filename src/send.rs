@@ -76,42 +76,16 @@ fn blake3_file(path: &Path) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Build the HTTP client, resolving a remote tunnel host over DoH so a
-/// DNS-layer filter (e.g. Cisco Umbrella sinkholing `*.trycloudflare.com`)
-/// can't redirect us to a block page. Falls back to system DNS if DoH is
-/// unavailable. Direct/LAN codes (IP or localhost) skip DoH entirely.
-async fn build_client(url: &url::Url) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
-    if let Some(host) = url.host_str() {
-        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
-        if !is_ip && host != "localhost" {
-            match crate::doh::resolve(host).await {
-                Ok(ips) if !ips.is_empty() => {
-                    let port = url.port_or_known_default().unwrap_or(443);
-                    let addrs: Vec<std::net::SocketAddr> = ips
-                        .iter()
-                        .map(|ip| std::net::SocketAddr::new(*ip, port))
-                        .collect();
-                    eprintln!("Resolved {host} via DoH ({} address(es))", addrs.len());
-                    builder = builder.resolve_to_addrs(host, &addrs);
-                }
-                Ok(_) => eprintln!("DoH returned no records for {host}; using system DNS"),
-                Err(e) => eprintln!("DoH lookup failed ({e:#}); using system DNS"),
-            }
-        }
-    }
-    Ok(builder.build()?)
-}
-
 pub async fn send(
     code: &Code,
     source: Source,
     progress: Option<indicatif::ProgressBar>,
+    tls: &crate::http::TlsOpts,
 ) -> anyhow::Result<String> {
     let key = code.secret.data_key();
     let token = code.secret.auth_token();
     let base = code.base_url.as_str().trim_end_matches('/').to_string();
-    let client = build_client(&code.base_url).await?;
+    let client = crate::http::client(tls)?;
 
     let manifest = build_manifest(&source)?;
     let manifest_body = seal_json(&key, Domain::Manifest, b"", &manifest);
@@ -297,7 +271,9 @@ mod tests {
         std::fs::write(src_dir.path().join("big.bin"), &content).unwrap();
 
         let source = archive::prepare(&[src_dir.path().join("big.bin")]).unwrap();
-        send(&code, source, None).await.unwrap();
+        send(&code, source, None, &crate::http::TlsOpts::default())
+            .await
+            .unwrap();
 
         assert_eq!(std::fs::read(out.path().join("big.bin")).unwrap(), content);
     }
@@ -306,7 +282,9 @@ mod tests {
     async fn sends_text() {
         let (code, _out, mut h) = spawn_receiver(false).await;
         let source = archive::prepare_text("meet at noon");
-        send(&code, source, None).await.unwrap();
+        send(&code, source, None, &crate::http::TlsOpts::default())
+            .await
+            .unwrap();
         let mut got_text = None;
         while let Some(ev) = h.events_rx.recv().await {
             if let crate::server::Event::Text(t) = ev {
@@ -371,7 +349,9 @@ mod tests {
 
         // Now run the real sender: manifest ack must report chunk 0, sender fills the rest.
         let source2 = archive::prepare(&[src_dir.path().join("big.bin")]).unwrap();
-        send(&code, source2, None).await.unwrap();
+        send(&code, source2, None, &crate::http::TlsOpts::default())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(out.path().join("big.bin")).unwrap(), content);
     }
 
@@ -382,7 +362,10 @@ mod tests {
         let src_dir = tempfile::tempdir().unwrap();
         std::fs::write(src_dir.path().join("f.txt"), "x").unwrap();
         let source = archive::prepare(&[src_dir.path().join("f.txt")]).unwrap();
-        let err = send(&bad, source, None).await.unwrap_err().to_string();
+        let err = send(&bad, source, None, &crate::http::TlsOpts::default())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("401") || err.to_lowercase().contains("auth"),
             "{err}"

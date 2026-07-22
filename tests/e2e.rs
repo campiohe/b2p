@@ -43,7 +43,9 @@ async fn folder_round_trip() {
 
     let (code, _h) = spawn_receiver(out.path()).await;
     let source = archive::prepare(&[src.path().join("proj")]).unwrap();
-    b2p::send::send(&code, source, None).await.unwrap();
+    b2p::send::send(&code, source, None, &b2p::http::TlsOpts::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         fs::read(out.path().join("proj/readme.md")).unwrap(),
@@ -69,7 +71,9 @@ async fn multiple_paths_round_trip() {
 
     let (code, _h) = spawn_receiver(out.path()).await;
     let source = archive::prepare(&[src.path().join("a.txt"), src.path().join("b.txt")]).unwrap();
-    b2p::send::send(&code, source, None).await.unwrap();
+    b2p::send::send(&code, source, None, &b2p::http::TlsOpts::default())
+        .await
+        .unwrap();
 
     assert_eq!(fs::read(out.path().join("a.txt")).unwrap(), b"AAA");
     assert_eq!(fs::read(out.path().join("b.txt")).unwrap(), b"BB");
@@ -80,7 +84,9 @@ async fn text_round_trip() {
     let out = tempfile::tempdir().unwrap();
     let (code, mut h) = spawn_receiver(out.path()).await;
     let source = archive::prepare_text("the password is xyzzy");
-    b2p::send::send(&code, source, None).await.unwrap();
+    b2p::send::send(&code, source, None, &b2p::http::TlsOpts::default())
+        .await
+        .unwrap();
 
     let mut got = None;
     while let Some(ev) = h.events_rx.recv().await {
@@ -155,7 +161,9 @@ async fn interrupted_then_resumed_transfer() {
     // same out dir. The partial state must be picked up via the transfer-id fingerprint.
     let (code2, _h2) = spawn_receiver(out.path()).await;
     let source = archive::prepare(&[src.path().join("big.bin")]).unwrap();
-    b2p::send::send(&code2, source, None).await.unwrap();
+    b2p::send::send(&code2, source, None, &b2p::http::TlsOpts::default())
+        .await
+        .unwrap();
 
     assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), content);
     assert!(!out.path().join("big.bin.b2p-partial").exists());
@@ -170,6 +178,10 @@ async fn wrong_code_secret_cannot_transfer() {
     let (code, _h) = spawn_receiver(out.path()).await;
     let bad_code = Code::new(code.base_url.clone(), Secret::generate());
     let source = archive::prepare(&[src.path().join("f.txt")]).unwrap();
-    assert!(b2p::send::send(&bad_code, source, None).await.is_err());
+    assert!(
+        b2p::send::send(&bad_code, source, None, &b2p::http::TlsOpts::default())
+            .await
+            .is_err()
+    );
     assert!(!out.path().join("f.txt").exists());
 }

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context};
 use b2p::code::Code;
 use b2p::crypto::Secret;
+use b2p::http::TlsOpts;
 use b2p::server::{AcceptRequest, Event, ServerCfg};
 use b2p::{archive, progress, send, server, tunnel};
 use clap::{Parser, Subcommand};
@@ -14,6 +15,9 @@ use std::path::PathBuf;
     about = "Encrypted file transfer over plain HTTPS uploads"
 )]
 struct Cli {
+    /// Extra PEM CA bundle to trust (e.g. a TLS-inspecting proxy's root CA)
+    #[arg(long, global = true)]
+    cafile: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -57,18 +61,28 @@ async fn main() {
 }
 
 async fn run() -> anyhow::Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let tls = TlsOpts {
+        cafile: cli.cafile.clone(),
+    };
+    match cli.cmd {
         Cmd::Receive {
             out,
             direct,
             yes,
             overwrite,
-        } => receive(out, direct, yes, overwrite).await,
-        Cmd::Send { code, paths, text } => do_send(code, paths, text).await,
+        } => receive(out, direct, yes, overwrite, &tls).await,
+        Cmd::Send { code, paths, text } => do_send(code, paths, text, &tls).await,
     }
 }
 
-async fn receive(out: PathBuf, direct: bool, yes: bool, overwrite: bool) -> anyhow::Result<()> {
+async fn receive(
+    out: PathBuf,
+    direct: bool,
+    yes: bool,
+    overwrite: bool,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
     let secret = Secret::generate();
     let mut handles = server::start(
@@ -86,7 +100,7 @@ async fn receive(out: PathBuf, direct: bool, yes: bool, overwrite: bool) -> anyh
         tunnel::direct(handles.port)?
     } else {
         eprintln!("Opening tunnel...");
-        tunnel::start_cloudflared(handles.port).await?
+        tunnel::start_cloudflared(handles.port, tls).await?
     };
 
     let code = Code::new(tunnel_handle.url.clone(), secret);
@@ -139,7 +153,12 @@ async fn receive(out: PathBuf, direct: bool, yes: bool, overwrite: bool) -> anyh
     Ok(())
 }
 
-async fn do_send(code: String, paths: Vec<PathBuf>, text: Option<String>) -> anyhow::Result<()> {
+async fn do_send(
+    code: String,
+    paths: Vec<PathBuf>,
+    text: Option<String>,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
     let code = Code::parse(&code).context("invalid code — paste it exactly as printed")?;
     let source = match &text {
         Some(t) => archive::prepare_text(t),
@@ -153,7 +172,7 @@ async fn do_send(code: String, paths: Vec<PathBuf>, text: Option<String>) -> any
         archive::Source::Text { .. } => None,
     };
     eprintln!("Waiting for the receiver to accept...");
-    let desc = send::send(&code, source, bar.clone()).await?;
+    let desc = send::send(&code, source, bar.clone(), tls).await?;
     if let Some(b) = bar {
         b.finish();
     }
