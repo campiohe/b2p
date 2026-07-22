@@ -4,6 +4,7 @@ pub mod code;
 pub mod crypto;
 pub mod doctor;
 pub mod http;
+pub mod pake;
 pub mod progress;
 pub mod protocol;
 pub mod rvcode;
