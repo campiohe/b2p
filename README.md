@@ -28,7 +28,7 @@ On the sending machine:
     b2p send '<code>' --text "the wifi password is hunter2"
 
 Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
-`--overwrite`, `--direct` (same-LAN mode, no tunnel).
+`--overwrite`, `--direct` (same-LAN mode, no tunnel), `--cafile FILE` (extra root CA, both commands).
 
 ## Resume
 
@@ -37,14 +37,24 @@ If the receiver restarted (new code), re-run `send` with the new code — the
 partial data is matched by content fingerprint and only missing chunks are
 uploaded.
 
+## Diagnostics
+
+    b2p doctor            # is this network filtering DNS, inspecting TLS, blocking UDP?
+    b2p doctor '<code>'   # same checks, aimed at a specific code's host
+
+Every check names the layer (DNS / TLS / UDP / HTTPS) and ends with a one-line
+verdict. `b2p send` runs it automatically when it cannot reach the receiver.
+
 ## Notes
 
 - First `receive` run downloads a pinned, checksum-verified `cloudflared`
   binary into the b2p data directory.
-- The sender resolves the tunnel host over DNS-over-HTTPS (`1.1.1.1`, then
-  `8.8.8.8`), so DNS-layer filters that sinkhole `*.trycloudflare.com`
-  (e.g. Cisco Umbrella) are bypassed. It falls back to system DNS if DoH is
-  unreachable.
+- b2p trusts the operating system's certificate store (plus `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` / `--cafile`), so networks that run TLS inspection work as
+  long as the proxy's root CA is installed — `b2p doctor` tells you if it isn't.
+- The sender uses the system resolver. If a network DNS-blocks the tunnel
+  domain, `b2p doctor` names the block and suggests alternatives (v2 will add
+  transports that don't depend on a single domain).
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
 - `cargo test` runs the full offline test suite; `scripts/smoke-tunnel.sh`
