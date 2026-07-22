@@ -76,6 +76,97 @@ fn blake3_file(path: &Path) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+#[derive(Debug)]
+pub(crate) enum FailLayer {
+    Dns,
+    Tls,
+    Connect,
+    Other,
+}
+
+/// Classify a rendered error chain into the network layer that failed.
+/// Order matters: DNS wording is most specific, TLS next; generic
+/// connect/timeout wording comes last.
+pub(crate) fn classify_error_text(chain: &str) -> FailLayer {
+    let t = chain.to_ascii_lowercase();
+    if t.contains("dns error")
+        || t.contains("failed to lookup address")
+        || t.contains("name or service not known")
+        || t.contains("nodename nor servname")
+        || t.contains("no such host")
+    {
+        FailLayer::Dns
+    } else if t.contains("certificate")
+        || t.contains("unknownissuer")
+        || t.contains("handshake")
+        || t.contains("tls")
+    {
+        FailLayer::Tls
+    } else if t.contains("connect")
+        || t.contains("timed out")
+        || t.contains("timeout")
+        || t.contains("reset")
+        || t.contains("refused")
+    {
+        FailLayer::Connect
+    } else {
+        FailLayer::Other
+    }
+}
+
+fn error_chain_text(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        s.push_str(": ");
+        s.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    s
+}
+
+/// Turn a failed first request into a layered error message, and run the
+/// doctor against the code's host so the user sees *why* it failed
+/// (spec §6: run automatically on failure).
+async fn connect_failure(
+    url: &url::Url,
+    e: &reqwest::Error,
+    tls: &crate::http::TlsOpts,
+) -> anyhow::Error {
+    let host = url.host_str().unwrap_or("<no host>").to_string();
+    let chain = error_chain_text(e);
+    let layer = classify_error_text(&chain);
+    let (name, hint) = match layer {
+        FailLayer::Dns => (
+            "DNS",
+            format!("this network may be filtering {host} — see the diagnosis below"),
+        ),
+        FailLayer::Tls => (
+            "TLS",
+            "if this network intercepts TLS, add its root CA to the OS store or pass --cafile"
+                .to_string(),
+        ),
+        FailLayer::Connect => (
+            "transport",
+            "the receiver may be gone (re-run `b2p receive`), or the network blocks this host"
+                .to_string(),
+        ),
+        FailLayer::Other => ("transport", "unexpected failure".to_string()),
+    };
+    eprintln!("\n{name} layer failed reaching {host}: {chain}");
+    eprintln!("hint: {hint}");
+    if !matches!(layer, FailLayer::Other) {
+        eprintln!("\nRunning diagnostics (b2p doctor)...\n");
+        let report = crate::doctor::run(&crate::doctor::DoctorArgs {
+            target_host: Some(host.clone()),
+            cafile: tls.cafile.clone(),
+        })
+        .await;
+        eprintln!("{report}");
+    }
+    anyhow::anyhow!("{name} failure reaching {host} — see diagnostics above")
+}
+
 pub async fn send(
     code: &Code,
     source: Source,
@@ -90,14 +181,17 @@ pub async fn send(
     let manifest = build_manifest(&source)?;
     let manifest_body = seal_json(&key, Domain::Manifest, b"", &manifest);
 
-    let resp = client
+    let resp = match client
         .post(format!("{base}/v1/manifest"))
         .bearer_auth(&token)
         .body(manifest_body)
         .timeout(ACCEPT_TIMEOUT + Duration::from_secs(10))
         .send()
         .await
-        .context("cannot reach the receiver — check the code and their tunnel")?;
+    {
+        Ok(r) => r,
+        Err(e) => return Err(connect_failure(&code.base_url, &e, tls).await),
+    };
     if resp.status() == 401 {
         bail!("auth rejected (HTTP 401) — the code is wrong or expired");
     }
@@ -158,7 +252,7 @@ pub async fn send(
             }
         })
         .await
-        .context("upload failed after retries — re-run the same command to resume")?;
+        .context("upload failed after retries — re-run the same command to resume, or run `b2p doctor` if it keeps failing")?;
 
     let hash = tokio::task::spawn_blocking({
         let path = path.clone();
@@ -353,6 +447,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(out.path().join("big.bin")).unwrap(), content);
+    }
+
+    #[test]
+    fn classifies_layers_from_error_text() {
+        assert!(matches!(
+            classify_error_text(
+                "error sending request: dns error: failed to lookup address information"
+            ),
+            FailLayer::Dns
+        ));
+        assert!(matches!(
+            classify_error_text("invalid peer certificate: UnknownIssuer"),
+            FailLayer::Tls
+        ));
+        assert!(matches!(
+            classify_error_text("client error (Connect): tcp connect error: Connection refused"),
+            FailLayer::Connect
+        ));
+        assert!(matches!(
+            classify_error_text("operation timed out"),
+            FailLayer::Connect
+        ));
+        assert!(matches!(
+            classify_error_text("something odd"),
+            FailLayer::Other
+        ));
     }
 
     #[tokio::test]

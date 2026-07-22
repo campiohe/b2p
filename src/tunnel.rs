@@ -164,8 +164,9 @@ pub async fn start_cloudflared(
     .ok()
     .flatten()
     .context(
-        "tunnel did not come up within 30s — this network may block cloudflared; \
-         try --direct on a LAN, or run the receiver on a less restricted network",
+        "tunnel did not come up within 30s — this network may block cloudflared \
+         (run `b2p doctor` to check); try --direct on a LAN, or run the receiver \
+         on a less restricted network",
     )?;
 
     Ok(TunnelHandle {
