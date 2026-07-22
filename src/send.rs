@@ -76,6 +76,33 @@ fn blake3_file(path: &Path) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Build the HTTP client, resolving a remote tunnel host over DoH so a
+/// DNS-layer filter (e.g. Cisco Umbrella sinkholing `*.trycloudflare.com`)
+/// can't redirect us to a block page. Falls back to system DNS if DoH is
+/// unavailable. Direct/LAN codes (IP or localhost) skip DoH entirely.
+async fn build_client(url: &url::Url) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    if let Some(host) = url.host_str() {
+        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+        if !is_ip && host != "localhost" {
+            match crate::doh::resolve(host).await {
+                Ok(ips) if !ips.is_empty() => {
+                    let port = url.port_or_known_default().unwrap_or(443);
+                    let addrs: Vec<std::net::SocketAddr> = ips
+                        .iter()
+                        .map(|ip| std::net::SocketAddr::new(*ip, port))
+                        .collect();
+                    eprintln!("Resolved {host} via DoH ({} address(es))", addrs.len());
+                    builder = builder.resolve_to_addrs(host, &addrs);
+                }
+                Ok(_) => eprintln!("DoH returned no records for {host}; using system DNS"),
+                Err(e) => eprintln!("DoH lookup failed ({e:#}); using system DNS"),
+            }
+        }
+    }
+    Ok(builder.build()?)
+}
+
 pub async fn send(
     code: &Code,
     source: Source,
@@ -84,9 +111,7 @@ pub async fn send(
     let key = code.secret.data_key();
     let token = code.secret.auth_token();
     let base = code.base_url.as_str().trim_end_matches('/').to_string();
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()?;
+    let client = build_client(&code.base_url).await?;
 
     let manifest = build_manifest(&source)?;
     let manifest_body = seal_json(&key, Domain::Manifest, b"", &manifest);

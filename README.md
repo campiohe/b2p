@@ -41,6 +41,10 @@ uploaded.
 
 - First `receive` run downloads a pinned, checksum-verified `cloudflared`
   binary into the b2p data directory.
+- The sender resolves the tunnel host over DNS-over-HTTPS (`1.1.1.1`, then
+  `8.8.8.8`), so DNS-layer filters that sinkhole `*.trycloudflare.com`
+  (e.g. Cisco Umbrella) are bypassed. It falls back to system DNS if DoH is
+  unreachable.
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
 - `cargo test` runs the full offline test suite; `scripts/smoke-tunnel.sh`
