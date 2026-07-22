@@ -1,7 +1,9 @@
 pub mod archive;
+pub mod cloudflared_pins;
 pub mod code;
 pub mod crypto;
 pub mod protocol;
 pub mod send;
 pub mod server;
 pub mod store;
+pub mod tunnel;
