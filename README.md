@@ -45,3 +45,24 @@ uploaded.
   (tar spool on the sender, staging area on the receiver).
 - `cargo test` runs the full offline test suite; `scripts/smoke-tunnel.sh`
   exercises a real tunnel.
+
+## Development
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy`, and
+`cargo test` on every push and pull request to `main`.
+
+## Releases
+
+Prebuilt binaries for Linux, macOS (Intel + Apple Silicon), and Windows are
+attached to each [GitHub Release](https://github.com/campiohe/b2p/releases).
+
+To cut a release:
+
+1. Bump `version` in `Cargo.toml` and commit.
+2. Tag and push:
+
+       git tag v0.1.0
+       git push origin v0.1.0
+
+The release workflow (`.github/workflows/release.yml`) cross-compiles all four
+binaries and publishes them to a GitHub Release named after the tag.
