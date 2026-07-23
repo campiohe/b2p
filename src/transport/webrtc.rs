@@ -34,10 +34,20 @@ fn other(r: Role) -> Role {
     }
 }
 
+/// Item flowing through `WebRtcChannel`'s internal mpsc. webrtc-0.17.2 fires
+/// `on_close` on remote disconnect but does NOT drop the `on_message` closure
+/// (which holds a `Sender` clone kept alive by `WebRtcChannel`'s own `dc`
+/// handle) — so without an explicit close signal, `rx.recv()` would pend
+/// forever instead of erroring per the `MsgChannel` contract.
+enum Item {
+    Msg(Vec<u8>),
+    Closed,
+}
+
 /// A message channel over an open WebRTC data channel.
 pub struct WebRtcChannel {
     dc: Arc<RTCDataChannel>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Item>,
     _pc: Arc<RTCPeerConnection>, // kept alive for the channel's lifetime
 }
 
@@ -51,7 +61,10 @@ impl MsgChannel for WebRtcChannel {
         Ok(())
     }
     async fn recv(&mut self) -> anyhow::Result<Vec<u8>> {
-        self.rx.recv().await.context("data channel closed")
+        match self.rx.recv().await {
+            Some(Item::Msg(m)) => Ok(m),
+            Some(Item::Closed) | None => anyhow::bail!("data channel closed by peer"),
+        }
     }
 }
 
@@ -60,9 +73,23 @@ impl Drop for WebRtcChannel {
         // RTCPeerConnection has no Drop impl of its own; close() is the only
         // clean teardown (stops ICE/DTLS/SCTP + internal tasks). Best-effort:
         // skip if we're not inside a tokio runtime (e.g. during process exit).
+        //
+        // `dc.send()` only hands data to the local SCTP stack — it does not
+        // wait for the peer to receive it. Closing right away can tear down
+        // ICE/DTLS before a just-sent final message (e.g. a protocol's last
+        // ack) actually leaves the machine, which the peer would otherwise
+        // observe as a disconnect instead of that message. Give the local
+        // send queue a brief, bounded chance to drain first.
         let pc = self._pc.clone();
+        let dc = self.dc.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                for _ in 0..50 {
+                    if dc.buffered_amount().await == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 let _ = pc.close().await;
             });
         }
@@ -112,7 +139,7 @@ fn wire_local_ice(
             if let Some(c) = c {
                 if let Ok(init) = c.to_json() {
                     if let Ok(json) = serde_json::to_vec(&init) {
-                        let sealed = seal_random(&sig_key, b"", &json);
+                        let sealed = seal_random(&sig_key, &[KIND_ICE, role_byte(role)], &json);
                         let _ = rv
                             .publish(&topic, &encode_frame(KIND_ICE, role, &sealed))
                             .await;
@@ -123,14 +150,21 @@ fn wire_local_ice(
     }));
 }
 
-/// Bridge the data channel's on_message to an mpsc the MsgChannel drains,
-/// and fire `open` when the channel opens.
-fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+/// Bridge the data channel's on_message/on_close to an mpsc the MsgChannel
+/// drains, and fire `open` when the channel opens.
+fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>) -> mpsc::Receiver<Item> {
+    let (tx, rx) = mpsc::channel::<Item>(64);
+    let close_tx = tx.clone();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let tx = tx.clone();
         Box::pin(async move {
-            let _ = tx.send(msg.data.to_vec()).await;
+            let _ = tx.send(Item::Msg(msg.data.to_vec())).await;
+        })
+    }));
+    dc.on_close(Box::new(move || {
+        let close_tx = close_tx.clone();
+        Box::pin(async move {
+            let _ = close_tx.send(Item::Closed).await;
         })
     }));
     let open2 = open.clone();
@@ -143,40 +177,35 @@ fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>) -> mpsc::Receiver<V
     rx
 }
 
-pub async fn connect(
-    rv: Arc<dyn Rendezvous>,
-    topic: &str,
-    key: &SessionKey,
-    role: Role,
-    stun_servers: &[String],
-    timeout: Duration,
-) -> anyhow::Result<WebRtcChannel> {
-    let pc = build_pc(stun_servers).await?;
-    match connect_inner(&pc, rv, topic, key, role, timeout).await {
-        Ok((dc, rx)) => Ok(WebRtcChannel { dc, rx, _pc: pc }),
-        Err(e) => {
-            // Ensure ICE/DTLS/SCTP + internal tasks are torn down on any
-            // failed establishment, not just leaked until process exit.
-            let _ = pc.close().await;
-            Err(e)
-        }
+/// Aborts the wrapped task when dropped — guarantees the signaling pump task
+/// (spawned in `establish`) never leaks, whether `establish` returns
+/// successfully, errors out via `?`, or is cancelled by `connect`'s outer
+/// timeout.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-async fn connect_inner(
-    pc: &Arc<RTCPeerConnection>,
+/// Establish an `RTCPeerConnection`'s data channel over `rv`: subscribes,
+/// wires ICE/data-channel handlers, drives the offer (Receiver) or waits for
+/// it (Sender), and waits for the channel to open. Unbounded by itself —
+/// `connect` applies the single overall deadline and tears down `pc` (and
+/// aborts the signaling pump, via `AbortOnDrop`) on every exit path.
+async fn establish(
+    pc: Arc<RTCPeerConnection>,
     rv: Arc<dyn Rendezvous>,
     topic: &str,
     key: &SessionKey,
     role: Role,
-    timeout: Duration,
-) -> anyhow::Result<(Arc<RTCDataChannel>, mpsc::Receiver<Vec<u8>>)> {
+) -> anyhow::Result<WebRtcChannel> {
     let sig_key = key.signaling_key();
-    wire_local_ice(pc, rv.clone(), topic.to_string(), sig_key, role);
+    wire_local_ice(&pc, rv.clone(), topic.to_string(), sig_key, role);
 
     let open = Arc::new(Notify::new());
     // channel handle differs by role: receiver creates it, sender receives it.
-    let (chan_tx, mut chan_rx) = mpsc::channel::<(Arc<RTCDataChannel>, mpsc::Receiver<Vec<u8>>)>(1);
+    let (chan_tx, mut chan_rx) = mpsc::channel::<(Arc<RTCDataChannel>, mpsc::Receiver<Item>)>(1);
 
     match role {
         Role::Receiver => {
@@ -217,7 +246,7 @@ async fn connect_inner(
             if r != want_role {
                 continue; // our own echo or the wrong peer
             }
-            let Ok(plain) = open_random(&sig_key, b"", payload) else {
+            let Ok(plain) = open_random(&sig_key, &[kind, r], payload) else {
                 continue;
             };
             if kind == KIND_SDP {
@@ -235,7 +264,8 @@ async fn connect_inner(
                     if let Ok(answer) = pump_pc.create_answer(None).await {
                         if pump_pc.set_local_description(answer.clone()).await.is_ok() {
                             if let Ok(j) = serde_json::to_vec(&answer) {
-                                let sealed = seal_random(&sig_key, b"", &j);
+                                let sealed =
+                                    seal_random(&sig_key, &[KIND_SDP, role_byte(role)], &j);
                                 let _ = pump_rv
                                     .publish(&pump_topic, &encode_frame(KIND_SDP, role, &sealed))
                                     .await;
@@ -254,33 +284,57 @@ async fn connect_inner(
             }
         }
     });
+    // Guarantees the pump is aborted on every exit path below: success
+    // return, `?` error, or cancellation by `connect`'s outer timeout. Once
+    // the channel is open there's nothing left for the pump to apply for a
+    // one-shot transfer, so aborting on success is correct too.
+    let _pump_guard = AbortOnDrop(pump.abort_handle());
 
     // Receiver drives the offer.
     if role == Role::Receiver {
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer.clone()).await?;
         let j = serde_json::to_vec(&offer)?;
-        let sealed = seal_random(&sig_key, b"", &j);
+        let sealed = seal_random(&sig_key, &[KIND_SDP, role_byte(role)], &j);
         rv.publish(topic, &encode_frame(KIND_SDP, role, &sealed))
             .await?;
     }
 
-    // Wait for the data channel to open, bounded.
-    tokio::time::timeout(timeout, open.notified())
-        .await
-        .context(
-            "WebRTC did not connect in time — UDP/STUN may be blocked; \
-             run `b2p doctor`, try --tunnel, or connect on the same LAN",
-        )?;
+    // Wait for the data channel to open. No inner timeout here — `connect`
+    // bounds this whole function (subscribe/publish/wait) with one deadline.
+    open.notified().await;
     let (dc, rx) = chan_rx
         .recv()
         .await
         .context("data channel opened but handle was lost")?;
-    // Stops applying further trickled ICE once the channel is open; fine for
-    // a one-shot transfer — connection migration / better candidate pairs
-    // are out of scope for P1.
-    pump.abort();
-    Ok((dc, rx))
+    Ok(WebRtcChannel { dc, rx, _pc: pc })
+}
+
+pub async fn connect(
+    rv: Arc<dyn Rendezvous>,
+    topic: &str,
+    key: &SessionKey,
+    role: Role,
+    stun_servers: &[String],
+    timeout: Duration,
+) -> anyhow::Result<WebRtcChannel> {
+    let pc = build_pc(stun_servers).await?;
+    match tokio::time::timeout(timeout, establish(pc.clone(), rv, topic, key, role)).await {
+        Ok(Ok(ch)) => Ok(ch),
+        Ok(Err(e)) => {
+            // Ensure ICE/DTLS/SCTP + internal tasks are torn down on any
+            // failed establishment, not just leaked until process exit.
+            let _ = pc.close().await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = pc.close().await;
+            anyhow::bail!(
+                "WebRTC did not connect in time — UDP/STUN may be blocked; \
+                 run `b2p doctor`, try --tunnel, or connect on the same LAN"
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +452,57 @@ mod tests {
         assert_eq!(
             std::fs::read(out.path().join("payload.bin")).unwrap(),
             content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_errors_when_peer_disconnects() {
+        let rv = MemRendezvous::new();
+        let key = SessionKey([7u8; 32]);
+        let topic = "b2p-p1d-disconnect-test";
+
+        let (rv_r, key_r) = (rv.clone(), key.clone());
+        let recv_task = tokio::spawn(async move {
+            connect(
+                rv_r,
+                topic,
+                &key_r,
+                Role::Receiver,
+                &[],
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .unwrap()
+        });
+
+        let (rv_s, key_s) = (rv.clone(), key.clone());
+        let send_task = tokio::spawn(async move {
+            connect(
+                rv_s,
+                topic,
+                &key_s,
+                Role::Sender,
+                &[],
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .unwrap()
+        });
+
+        let mut recv_ch = recv_task.await.unwrap();
+        let send_ch = send_task.await.unwrap();
+
+        // Drop the sender's channel: its `Drop` impl closes its `pc`, tearing
+        // down ICE/DTLS/SCTP — the receiver's data channel should observe
+        // this as a remote close and fire `on_close`.
+        drop(send_ch);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), recv_ch.recv())
+            .await
+            .expect("recv should observe the peer's disconnect, not hang");
+        assert!(
+            result.is_err(),
+            "recv should return Err once the peer's data channel closes, not hang or succeed"
         );
     }
 }
