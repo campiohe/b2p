@@ -25,9 +25,15 @@ pub struct RendezvousCode {
     spelling: Spelling,
 }
 
-/// Topic id (base58 of 16 KDF bytes) derived from human-code entropy.
-fn topic_from_entropy(e: &[u8]) -> String {
-    let full = blake3::derive_key(TOPIC_CTX, e);
+/// Topic id (base58 of 16 KDF bytes) derived from the channel byte only.
+///
+/// CRITICAL: must NOT depend on the full entropy `e` (which is also the PAKE
+/// password) — publishing a deterministic hash of the whole secret would let
+/// the ntfy operator brute-force all 2^24 values (~1s) and recover the
+/// password, defeating the PAKE. The channel byte alone is public-ish
+/// (256 possible values) and is not sensitive.
+fn topic_from_channel(channel: u8) -> String {
+    let full = blake3::derive_key(TOPIC_CTX, &[channel]);
     bs58::encode(&full[..16]).into_string()
 }
 
@@ -53,11 +59,17 @@ pub fn parse(s: &str) -> anyhow::Result<RendezvousCode> {
         if topic.is_empty() {
             bail!("b2p code has an empty topic");
         }
+        let topic_bytes = bs58::decode(topic)
+            .into_vec()
+            .context("b2p code topic is not valid base58")?;
+        if topic_bytes.len() != 16 {
+            bail!("b2p code topic must be 16 bytes (base58)");
+        }
         let secret = bs58::decode(secret_b58)
             .into_vec()
             .context("b2p code secret is not valid base58")?;
-        if secret.is_empty() {
-            bail!("b2p code has an empty secret");
+        if secret.len() != 16 {
+            bail!("b2p code secret must be 16 bytes (base58)");
         }
         return Ok(RendezvousCode {
             topic: topic.to_string(),
@@ -80,7 +92,7 @@ pub fn parse(s: &str) -> anyhow::Result<RendezvousCode> {
         .with_context(|| format!("'{}' is not in the word list", parts[2]))?;
     let e = vec![channel, i1, i2];
     Ok(RendezvousCode {
-        topic: topic_from_entropy(&e),
+        topic: topic_from_channel(e[0]),
         secret: PakeSecret(e),
         spelling: Spelling::Human,
     })
@@ -91,7 +103,7 @@ impl RendezvousCode {
         let mut e = [0u8; 3];
         rand::rngs::OsRng.fill_bytes(&mut e);
         RendezvousCode {
-            topic: topic_from_entropy(&e),
+            topic: topic_from_channel(e[0]),
             secret: PakeSecret(e.to_vec()),
             spelling: Spelling::Human,
         }
@@ -141,42 +153,58 @@ mod tests {
 
     #[test]
     fn human_round_trips_and_derives_topic() {
-        let c = parse("7-tiger-zebra").unwrap();
-        // secret is the 3 entropy bytes: channel, index(tiger), index(zebra)
+        let c = parse("7-otter-zebra").unwrap();
+        // secret is the 3 entropy bytes: channel, index(otter), index(zebra)
         assert_eq!(
             c.secret.0,
             vec![
                 7u8,
-                crate::words::index_of("tiger").unwrap(),
+                crate::words::index_of("otter").unwrap(),
                 crate::words::index_of("zebra").unwrap()
             ]
         );
         // topic is a non-empty base58 string, deterministic for the same code
         assert!(!c.topic.is_empty());
-        assert_eq!(c.topic, parse("7-tiger-zebra").unwrap().topic);
+        assert_eq!(c.topic, parse("7-otter-zebra").unwrap().topic);
         // re-renders to the same human spelling
-        assert_eq!(c.to_string(), "7-tiger-zebra");
+        assert_eq!(c.to_string(), "7-otter-zebra");
     }
 
     #[test]
-    fn different_human_codes_give_different_topics() {
+    fn topic_depends_on_channel_only() {
+        // different channel → different topic
         assert_ne!(
-            parse("7-tiger-zebra").unwrap().topic,
-            parse("8-tiger-zebra").unwrap().topic
+            parse("7-otter-zebra").unwrap().topic,
+            parse("8-otter-zebra").unwrap().topic
         );
-        assert_ne!(
-            parse("7-tiger-zebra").unwrap().topic,
-            parse("7-ocean-zebra").unwrap().topic
+        // same channel, different words → SAME topic (topic derives from channel only)
+        assert_eq!(
+            parse("7-otter-zebra").unwrap().topic,
+            parse("7-acorn-robin").unwrap().topic
+        );
+    }
+
+    #[test]
+    fn golden_topic_vectors() {
+        // FROZEN: these pin the channel-only topic derivation; a change to
+        // TOPIC_CTX, the [..16] truncation, or the base58 alphabet breaks them.
+        assert_eq!(
+            parse("7-otter-zebra").unwrap().topic,
+            "7SaLbusu7A4TnKctM3GTFJ"
+        );
+        assert_eq!(
+            parse("0-acorn-robin").unwrap().topic,
+            "NouJdm45AHRLQ9rj5orVCw"
         );
     }
 
     #[test]
     fn human_rejects_bad_input() {
-        assert!(parse("300-tiger-zebra").is_err()); // channel > 255
+        assert!(parse("300-otter-zebra").is_err()); // channel > 255
         assert!(parse("7-notaword-zebra").is_err()); // unknown word
-        assert!(parse("7-tiger").is_err()); // too few parts
-        assert!(parse("7-tiger-zebra-extra").is_err());
-        assert!(parse("x-tiger-zebra").is_err()); // non-numeric channel
+        assert!(parse("7-otter").is_err()); // too few parts
+        assert!(parse("7-otter-zebra-extra").is_err());
+        assert!(parse("x-otter-zebra").is_err()); // non-numeric channel
     }
 
     #[test]
@@ -198,6 +226,14 @@ mod tests {
         assert!(parse("b2p://#deadbeef").is_err()); // empty topic
         assert!(parse("b2p://sometopic#").is_err()); // empty secret
         assert!(parse("https://x.com#abc").is_err()); // not a rendezvous code (that's a tunnel code)
+        assert!(parse("b2p://../admin#3yZe7B4vN9pQ2sKfTgWxUm").is_err()); // topic not valid 16-byte base58
+        let valid = RendezvousCode::generate_url().to_string();
+        let (valid_topic, _) = valid
+            .strip_prefix("b2p://")
+            .unwrap()
+            .split_once('#')
+            .unwrap();
+        assert!(parse(&format!("b2p://{valid_topic}#2")).is_err()); // secret decodes to < 16 bytes
     }
 
     #[test]
@@ -211,7 +247,7 @@ mod tests {
 
     #[test]
     fn classifier_distinguishes_forms() {
-        assert!(is_rendezvous_code("7-tiger-zebra"));
+        assert!(is_rendezvous_code("7-otter-zebra"));
         assert!(is_rendezvous_code("b2p://topic#secret"));
         assert!(!is_rendezvous_code("https://foo.trycloudflare.com#abc")); // tunnel code
         assert!(!is_rendezvous_code("garbage"));

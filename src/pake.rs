@@ -114,4 +114,24 @@ mod tests {
         assert!(!verify_confirmation(&ka, Role::Sender, &conf_recv));
         assert!(!verify_confirmation(&ka, Role::Receiver, &conf_recv[..16]));
     }
+
+    #[test]
+    fn finish_rejects_garbage_peer_message() {
+        let (pa, _ma) = Pake::start(&PakeSecret(vec![1, 2, 3]), "topic");
+        assert!(pa.finish(b"not a valid spake2 message").is_err());
+    }
+
+    #[test]
+    fn golden_confirmation_vector() {
+        // FROZEN: pins the keyed-hash confirmation tag construction.
+        let key = SessionKey([0x11u8; 32]);
+        assert_eq!(
+            hex::encode(confirmation(&key, Role::Receiver)),
+            "52a4095ab3cc8f216bcd5147a0978d99bed6dec4ae39f07f8ab50f171b668ffc"
+        );
+        assert_eq!(
+            hex::encode(confirmation(&key, Role::Sender)),
+            "57f2c8c7d298695bf5ae7c20a097e6886d48e40699cc7ec654535fc6a2aaa841"
+        );
+    }
 }
