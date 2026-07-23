@@ -13,6 +13,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -59,22 +60,35 @@ pub struct WebRtcChannel {
     dc: Arc<RTCDataChannel>,
     rx: mpsc::Receiver<Item>,
     _pc: Arc<RTCPeerConnection>, // kept alive for the channel's lifetime
+    // Close latch: set + notified by the same handlers that push `Item::Closed`
+    // (on_close and on_peer_connection_state_change). Lets `send` bail instead
+    // of hanging inside `dc.send` on SCTP backpressure when the peer is gone.
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
 }
 
 #[async_trait]
 impl MsgChannel for WebRtcChannel {
-    // TODO(p2): a `send` already parked on SCTP's 128 MiB backpressure
-    // semaphore (webrtc-rs's association) with a dead-but-not-yet-detected
-    // peer won't unblock on the close signal below — it's waiting inside
-    // `dc.send`, not on `rx`. Follow-up: guard `send` with a
-    // `tokio::select!` against a close notification (e.g. a `Notify` set by
-    // the same `on_close`/`on_peer_connection_state_change` handlers).
     async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
-        self.dc
-            .send(&Bytes::copy_from_slice(msg))
-            .await
-            .context("data channel send failed")?;
-        Ok(())
+        // Fast path: already-closed before we even start the send.
+        if self.closed_flag.load(Ordering::Relaxed) {
+            anyhow::bail!("data channel closed by peer");
+        }
+        // A `dc.send` parked on SCTP's 128 MiB backpressure semaphore never
+        // wakes if the peer died; race it against the close signal so a dead
+        // peer surfaces as a bounded Err. `notify_waiters` wakes this
+        // already-registered `notified()` when close is detected. Bind `bytes`
+        // outside the select so it outlives the borrowed `dc.send` future.
+        let bytes = Bytes::copy_from_slice(msg);
+        tokio::select! {
+            r = self.dc.send(&bytes) => {
+                r.context("data channel send failed")?;
+                Ok(())
+            }
+            _ = self.closed_notify.notified() => {
+                anyhow::bail!("data channel closed by peer")
+            }
+        }
     }
     async fn recv(&mut self) -> anyhow::Result<Vec<u8>> {
         match self.rx.recv().await {
@@ -171,7 +185,13 @@ fn wire_local_ice(
 /// Bridge the data channel's on_message/on_close to `tx` (an mpsc the
 /// MsgChannel drains — shared with `establish`'s peer-connection-state-change
 /// handler, see `Item`), and fire `open` when the channel opens.
-fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>, tx: mpsc::Sender<Item>) {
+fn wire_channel(
+    dc: &Arc<RTCDataChannel>,
+    open: Arc<Notify>,
+    tx: mpsc::Sender<Item>,
+    closed_flag: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
+) {
     let msg_tx = tx.clone();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let msg_tx = msg_tx.clone();
@@ -182,7 +202,11 @@ fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>, tx: mpsc::Sender<It
     let close_tx = tx.clone();
     dc.on_close(Box::new(move || {
         let close_tx = close_tx.clone();
+        let closed_flag = closed_flag.clone();
+        let closed_notify = closed_notify.clone();
         Box::pin(async move {
+            closed_flag.store(true, Ordering::Relaxed);
+            closed_notify.notify_waiters();
             let _ = close_tx.send(Item::Closed).await;
         })
     }));
@@ -228,6 +252,8 @@ async fn establish(
     // clean data-channel close or an abrupt ICE `Failed`/pc `Closed` surfaces
     // as a bounded `Err` there instead of pending forever.
     let (tx, rx) = mpsc::channel::<Item>(64);
+    let closed_flag = Arc::new(AtomicBool::new(false));
+    let closed_notify = Arc::new(Notify::new());
 
     // Abrupt peer death (Ctrl-C/crash/network drop, i.e. no clean
     // `pc.close()`): ICE goes `Failed` ~25-30s after loss but only deletes
@@ -239,13 +265,19 @@ async fn establish(
     // first and returns Err either way.
     {
         let tx = tx.clone();
+        let closed_flag = closed_flag.clone();
+        let closed_notify = closed_notify.clone();
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let tx = tx.clone();
+            let closed_flag = closed_flag.clone();
+            let closed_notify = closed_notify.clone();
             Box::pin(async move {
                 if matches!(
                     s,
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
                 ) {
+                    closed_flag.store(true, Ordering::Relaxed);
+                    closed_notify.notify_waiters();
                     let _ = tx.send(Item::Closed).await;
                 }
             })
@@ -258,19 +290,29 @@ async fn establish(
     match role {
         Role::Receiver => {
             let dc = pc.create_data_channel("b2p", None).await?;
-            wire_channel(&dc, open.clone(), tx.clone());
+            wire_channel(
+                &dc,
+                open.clone(),
+                tx.clone(),
+                closed_flag.clone(),
+                closed_notify.clone(),
+            );
             chan_tx.send(dc).await.ok();
         }
         Role::Sender => {
             let open2 = open.clone();
             let chan_tx2 = chan_tx.clone();
             let tx2 = tx.clone();
+            let cf = closed_flag.clone();
+            let cn = closed_notify.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let open2 = open2.clone();
                 let chan_tx2 = chan_tx2.clone();
                 let tx2 = tx2.clone();
+                let cf = cf.clone();
+                let cn = cn.clone();
                 Box::pin(async move {
-                    wire_channel(&dc, open2.clone(), tx2.clone());
+                    wire_channel(&dc, open2.clone(), tx2.clone(), cf.clone(), cn.clone());
                     let _ = chan_tx2.send(dc).await;
                 })
             }));
@@ -357,7 +399,13 @@ async fn establish(
         .recv()
         .await
         .context("data channel opened but handle was lost")?;
-    Ok(WebRtcChannel { dc, rx, _pc: pc })
+    Ok(WebRtcChannel {
+        dc,
+        rx,
+        _pc: pc,
+        closed_flag,
+        closed_notify,
+    })
 }
 
 pub async fn connect(
@@ -583,6 +631,46 @@ mod tests {
         assert!(
             result.is_err(),
             "recv should return Err once the peer's data channel closes, not hang or succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_errors_when_peer_disconnects() {
+        let rv = MemRendezvous::new();
+        let key = SessionKey([9u8; 32]);
+        let topic = "b2p-p2a-send-stall-test";
+
+        let (rv_r, key_r) = (rv.clone(), key.clone());
+        let recv_task = tokio::spawn(async move {
+            connect(rv_r, topic, &key_r, Role::Receiver, &[], Duration::from_secs(20))
+                .await
+                .unwrap()
+        });
+        let (rv_s, key_s) = (rv.clone(), key.clone());
+        let send_task = tokio::spawn(async move {
+            connect(rv_s, topic, &key_s, Role::Sender, &[], Duration::from_secs(20))
+                .await
+                .unwrap()
+        });
+        let recv_ch = recv_task.await.unwrap();
+        let mut send_ch = send_task.await.unwrap();
+
+        // Kill the receiver: its Drop closes the pc; the sender must observe the
+        // disconnect and error out of send, not hang.
+        drop(recv_ch);
+
+        let result = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if send_ch.send(b"ping").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "send should return Err once the peer disconnects, not hang"
         );
     }
 }
