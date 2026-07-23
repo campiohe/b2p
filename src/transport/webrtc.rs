@@ -1,7 +1,8 @@
 //! WebRTC data-channel transport (design §4.1–4.2). Establishes an
 //! `RTCPeerConnection`, exchanges SDP + trickled ICE (each E2E-encrypted under
 //! the session `signaling_key`) over a `Rendezvous`, and exposes the opened
-//! data channel as a `stream::MsgChannel`. STUN-only in P1 (no TURN → P2).
+//! data channel as a `stream::MsgChannel`. STUN by default; TURN relay servers
+//! (with credentials) are accepted via the ICE-server list (P2a).
 
 use crate::crypto::{open_random, seal_random};
 use crate::handshake::{decode_frame, encode_frame, role_byte, KIND_ICE, KIND_SDP};
@@ -111,21 +112,24 @@ impl Drop for WebRtcChannel {
     }
 }
 
-fn build_pc_config(stun_servers: &[String]) -> RTCConfiguration {
+fn build_pc_config(ice_servers: &[crate::turn::IceServer]) -> RTCConfiguration {
     RTCConfiguration {
-        ice_servers: if stun_servers.is_empty() {
-            vec![] // tests: host candidates only (loopback)
-        } else {
-            vec![RTCIceServer {
-                urls: stun_servers.to_vec(),
-                ..Default::default()
-            }]
-        },
+        // Empty input → no ICE servers → host candidates only (loopback tests).
+        ice_servers: ice_servers
+            .iter()
+            .map(|s| RTCIceServer {
+                urls: s.urls.clone(),
+                username: s.username.clone(),
+                credential: s.credential.clone(),
+            })
+            .collect(),
         ..Default::default()
     }
 }
 
-async fn build_pc(stun_servers: &[String]) -> anyhow::Result<Arc<RTCPeerConnection>> {
+async fn build_pc(
+    ice_servers: &[crate::turn::IceServer],
+) -> anyhow::Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut m)?;
@@ -134,8 +138,7 @@ async fn build_pc(stun_servers: &[String]) -> anyhow::Result<Arc<RTCPeerConnecti
         .with_interceptor_registry(registry)
         .build();
     Ok(Arc::new(
-        api.new_peer_connection(build_pc_config(stun_servers))
-            .await?,
+        api.new_peer_connection(build_pc_config(ice_servers)).await?,
     ))
 }
 
@@ -362,10 +365,10 @@ pub async fn connect(
     topic: &str,
     key: &SessionKey,
     role: Role,
-    stun_servers: &[String],
+    ice_servers: &[crate::turn::IceServer],
     timeout: Duration,
 ) -> anyhow::Result<WebRtcChannel> {
-    let pc = build_pc(stun_servers).await?;
+    let pc = build_pc(ice_servers).await?;
     match tokio::time::timeout(timeout, establish(pc.clone(), rv, topic, key, role)).await {
         Ok(Ok(ch)) => Ok(ch),
         Ok(Err(e)) => {
@@ -444,6 +447,36 @@ mod tests {
         async fn close(&self) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn build_pc_config_maps_credentials() {
+        use crate::turn::IceServer;
+        let servers = vec![
+            IceServer {
+                urls: vec!["stun:s:1".into()],
+                username: String::new(),
+                credential: String::new(),
+            },
+            IceServer {
+                urls: vec!["turns:t:443?transport=tcp".into()],
+                username: "u".into(),
+                credential: "c".into(),
+            },
+        ];
+        let cfg = build_pc_config(&servers);
+        assert_eq!(cfg.ice_servers.len(), 2);
+        assert_eq!(cfg.ice_servers[1].username, "u");
+        assert_eq!(cfg.ice_servers[1].credential, "c");
+        assert_eq!(
+            cfg.ice_servers[1].urls,
+            vec!["turns:t:443?transport=tcp".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_pc_config_empty_is_host_only() {
+        assert!(build_pc_config(&[]).ice_servers.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

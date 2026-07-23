@@ -1,6 +1,6 @@
 //! P1 session orchestration: run the PAKE handshake, form the WebRTC
 //! transport, and move the payload — the composition `b2p receive`/`send`
-//! use by default (design §5). Parameterized on a `Rendezvous` + STUN list
+//! use by default (design §5). Parameterized on a `Rendezvous` + ICE-server list
 //! so it runs offline in tests (MemRendezvous + loopback). One handshake +
 //! one transfer per call — a SessionKey is single-use (see stream::stream_key).
 
@@ -48,14 +48,14 @@ pub async fn receive_p1(
     secret: &[u8],
     out_dir: &Path,
     accept: impl FnOnce(&Manifest) -> bool + Send,
-    stun: &[String],
+    ice_servers: &[crate::turn::IceServer],
     timeout: Duration,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
     let key = handshake(rv.as_ref(), topic, secret, Role::Receiver)
         .await
         .map_err(EstablishError)?;
-    let mut ch = connect(rv.clone(), topic, &key, Role::Receiver, stun, timeout)
+    let mut ch = connect(rv.clone(), topic, &key, Role::Receiver, ice_servers, timeout)
         .await
         .map_err(EstablishError)?;
     let desc = recv_into(&mut ch, &key, out_dir, accept, progress).await?;
@@ -74,14 +74,14 @@ pub async fn send_p1(
     topic: &str,
     secret: &[u8],
     source: &Source,
-    stun: &[String],
+    ice_servers: &[crate::turn::IceServer],
     timeout: Duration,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
     let key = handshake(rv.as_ref(), topic, secret, Role::Sender)
         .await
         .map_err(EstablishError)?;
-    let mut ch = connect(rv.clone(), topic, &key, Role::Sender, stun, timeout)
+    let mut ch = connect(rv.clone(), topic, &key, Role::Sender, ice_servers, timeout)
         .await
         .map_err(EstablishError)?;
     send_source(&mut ch, &key, source, progress).await

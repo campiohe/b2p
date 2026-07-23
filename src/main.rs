@@ -22,6 +22,16 @@ const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
 /// running the doctor.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The STUN defaults as a single `IceServer` (no credentials). TURN entries are
+/// appended in `ice_servers` (Task 3).
+fn default_ice_servers() -> Vec<b2p::turn::IceServer> {
+    vec![b2p::turn::IceServer {
+        urls: STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+        username: String::new(),
+        credential: String::new(),
+    }]
+}
+
 #[derive(Parser)]
 #[command(name = "b2p", version, about = "Encrypted peer-to-peer file transfer")]
 struct Cli {
@@ -263,7 +273,7 @@ async fn receive_p1_cli(
     let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
     let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
         Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-    let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+    let ice = default_ice_servers();
     let out_for_accept = out.clone();
     let accept =
         move |m: &b2p::protocol::Manifest| accept_decision(m, &out_for_accept, yes, overwrite);
@@ -274,7 +284,7 @@ async fn receive_p1_cli(
         &code.secret.0,
         &out,
         accept,
-        &stun,
+        &ice,
         CONNECT_TIMEOUT,
         None,
     )
@@ -325,7 +335,7 @@ async fn do_send(
             let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
             let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
                 Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-            let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+            let ice = default_ice_servers();
             let bar = match &source {
                 archive::Source::Blob { total_size, .. } => {
                     Some(progress::transfer_bar(*total_size))
@@ -338,7 +348,7 @@ async fn do_send(
                 &rc.topic,
                 &rc.secret.0,
                 &source,
-                &stun,
+                &ice,
                 CONNECT_TIMEOUT,
                 bar.clone(),
             )
