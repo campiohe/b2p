@@ -9,7 +9,7 @@ use crate::handshake::handshake;
 use crate::pake::Role;
 use crate::protocol::Manifest;
 use crate::rendezvous::Rendezvous;
-use crate::stream::{recv_into, send_source};
+use crate::stream::{recv_into, send_source, MsgChannel};
 use crate::transport::webrtc::connect;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +30,15 @@ pub async fn receive_p1(
 ) -> anyhow::Result<String> {
     let key = handshake(rv.as_ref(), topic, secret, Role::Receiver).await?;
     let mut ch = connect(rv.clone(), topic, &key, Role::Receiver, stun, timeout).await?;
-    recv_into(&mut ch, &key, out_dir, accept, progress).await
+    let desc = recv_into(&mut ch, &key, out_dir, accept, progress).await?;
+    // Graceful close: keep the connection alive until the sender closes it,
+    // which confirms the sender received our final CommitAck. Without this the
+    // receiver can tear down the peer connection before the CommitAck is flushed,
+    // hanging the sender's wait for it. A dropped/closed channel makes `recv`
+    // return Err (that's the expected success signal here); the timeout guards
+    // against a sender that died. Bounded so we never wait forever.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), ch.recv()).await;
+    Ok(desc)
 }
 
 pub async fn send_p1(
