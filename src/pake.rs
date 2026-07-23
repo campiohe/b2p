@@ -16,6 +16,14 @@ pub enum Role {
 #[derive(Clone)]
 pub struct SessionKey(pub [u8; 32]);
 
+impl SessionKey {
+    /// Subkey for the AEAD payload stream (design §4.3). Independent of the
+    /// raw session key so the two are never used as the same AEAD key.
+    pub fn stream_key(&self) -> [u8; 32] {
+        blake3::derive_key("b2p-v2 stream key v1", &self.0)
+    }
+}
+
 pub struct Pake {
     state: Spake2<Ed25519Group>,
 }
@@ -133,5 +141,13 @@ mod tests {
             hex::encode(confirmation(&key, Role::Sender)),
             "57f2c8c7d298695bf5ae7c20a097e6886d48e40699cc7ec654535fc6a2aaa841"
         );
+    }
+
+    #[test]
+    fn stream_key_is_derived_and_deterministic() {
+        let k = SessionKey([3u8; 32]);
+        assert_eq!(k.stream_key(), SessionKey([3u8; 32]).stream_key());
+        assert_ne!(k.stream_key(), k.0); // not the raw session key
+        assert_ne!(k.stream_key(), SessionKey([4u8; 32]).stream_key());
     }
 }

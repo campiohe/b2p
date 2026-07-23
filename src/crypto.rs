@@ -13,6 +13,8 @@ pub enum Domain {
     Manifest = 0x01,
     Data = 0x02,
     Commit = 0x03,
+    StreamToReceiver = 0x04,
+    StreamToSender = 0x05,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,5 +145,20 @@ mod tests {
         let parsed = Secret::from_base58(&s.to_base58()).unwrap();
         assert_eq!(s.0, parsed.0);
         assert!(Secret::from_base58("tooshort").is_err());
+    }
+
+    #[test]
+    fn stream_directions_have_independent_nonces() {
+        // Same key, same index, different direction domain -> different ciphertext,
+        // and a frame sealed one way must not open the other way (no nonce reuse).
+        let k = key();
+        let a = seal(&k, Domain::StreamToReceiver, 0, b"", b"frame");
+        let b = seal(&k, Domain::StreamToSender, 0, b"", b"frame");
+        assert_ne!(a, b);
+        assert!(open(&k, Domain::StreamToSender, 0, b"", &a).is_err());
+        assert_eq!(
+            open(&k, Domain::StreamToReceiver, 0, b"", &a).unwrap(),
+            b"frame"
+        );
     }
 }
