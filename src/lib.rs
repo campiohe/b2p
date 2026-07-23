@@ -16,5 +16,6 @@ pub mod store;
 pub mod stream;
 pub mod stun;
 pub mod tlsprobe;
+pub mod transport;
 pub mod tunnel;
 pub mod words;
