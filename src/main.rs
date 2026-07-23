@@ -23,11 +23,7 @@ const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
-#[command(
-    name = "b2p",
-    version,
-    about = "Encrypted file transfer over plain HTTPS uploads"
-)]
+#[command(name = "b2p", version, about = "Encrypted peer-to-peer file transfer")]
 struct Cli {
     /// Extra PEM CA bundle to trust (e.g. a TLS-inspecting proxy's root CA)
     #[arg(long, global = true)]
@@ -44,7 +40,7 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         out: PathBuf,
         /// Skip the tunnel and serve directly on the LAN (--tunnel only)
-        #[arg(long)]
+        #[arg(long, requires = "tunnel")]
         direct: bool,
         /// Accept the incoming transfer without prompting
         #[arg(long)]
@@ -285,7 +281,7 @@ async fn receive_p1_cli(
     .await
     {
         Ok(d) => d,
-        Err(e) => return connect_failed(e, &code.topic, tls).await,
+        Err(e) => return connect_failed(e, base, tls).await,
     };
     eprintln!("via WebRTC (STUN)");
     eprintln!("Done: {desc}");
@@ -325,7 +321,7 @@ async fn do_send(
         .await
         {
             Ok(d) => d,
-            Err(e) => return connect_failed(e, &rc.topic, tls).await,
+            Err(e) => return connect_failed(e, base, tls).await,
         };
         eprintln!("via WebRTC (STUN)");
         eprintln!("Done: {desc}");
@@ -349,16 +345,27 @@ async fn do_send(
 
 /// Run on a P1 connect failure (design §6): print the error, run the doctor,
 /// and surface both to the user before returning the original error.
-async fn connect_failed(e: anyhow::Error, topic: &str, tls: &TlsOpts) -> anyhow::Result<()> {
+///
+/// `rendezvous_base` is used only to point the doctor's DNS check at the
+/// right host. Note the doctor's rendezvous-*reachability* check is still
+/// hard-coded to ntfy.sh regardless of `--rendezvous` (a known limitation
+/// for custom rendezvous hosts — a follow-up; see src/doctor.rs).
+async fn connect_failed(
+    e: anyhow::Error,
+    rendezvous_base: &str,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
     eprintln!("\nCould not connect: {e:#}");
     eprintln!("Running diagnostics (b2p doctor)...\n");
+    let host = url::Url::parse(rendezvous_base)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string));
     let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
-        target_host: None,
+        target_host: host,
         cafile: tls.cafile.clone(),
     })
     .await;
     eprintln!("{report}");
-    let _ = topic;
     Err(e)
 }
 

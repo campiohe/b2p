@@ -39,10 +39,13 @@ Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
 
 ## Resume
 
-Interrupted transfers resume automatically: re-run the same `send` command.
-If the receiver restarted (new code), re-run `send` with the new code — the
-partial data is matched by content fingerprint and only missing chunks are
-uploaded.
+With `--tunnel`, interrupted transfers resume automatically: re-run the same
+`send` command. If the receiver restarted (new code), re-run `send` with the
+new code — the partial data is matched by content fingerprint and only
+missing chunks are uploaded.
+
+The default WebRTC transport does not resume yet: an interrupted transfer
+re-sends from the start on retry. Resume for it is a planned follow-up.
 
 ## Diagnostics
 
