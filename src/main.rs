@@ -24,6 +24,8 @@ const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
 /// slow-but-viable WAN path needs headroom; the extra wait is only felt on
 /// failure.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long a receiver sits in the relay room waiting for its sender.
+const WAIT_FOR_SENDER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The STUN defaults as a single `IceServer` (no credentials). TURN entries are
 /// appended in `ice_servers` (Task 3).
@@ -58,17 +60,17 @@ struct Cli {
 /// credentials (design §3.1), so either peer may set these independently.
 #[derive(clap::Args, Clone)]
 struct TurnArgs {
-    /// TURN relay URL (turn: UDP only — webrtc-ice can't do TLS/TCP). Repeat for several.
-    #[arg(long = "turn")]
+    /// TURN relay URL, --p2p only (turn: UDP only — webrtc-ice can't do TLS/TCP). Repeat for several.
+    #[arg(long = "turn", requires = "p2p")]
     turn: Vec<String>,
     /// coturn use-auth-secret shared secret; b2p mints a short-lived credential.
-    #[arg(long, conflicts_with_all = ["turn_user", "turn_pass"])]
+    #[arg(long, requires = "p2p", conflicts_with_all = ["turn_user", "turn_pass"])]
     turn_secret: Option<String>,
     /// Static TURN username (requires --turn-pass).
-    #[arg(long, requires = "turn_pass", conflicts_with = "turn_secret")]
+    #[arg(long, requires_all = ["turn_pass", "p2p"], conflicts_with = "turn_secret")]
     turn_user: Option<String>,
     /// Static TURN password (requires --turn-user).
-    #[arg(long, requires = "turn_user", conflicts_with = "turn_secret")]
+    #[arg(long, requires_all = ["turn_user", "p2p"], conflicts_with = "turn_secret")]
     turn_pass: Option<String>,
 }
 
@@ -88,7 +90,7 @@ impl TurnArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for a transfer over the peer-to-peer (WebRTC) stack by default.
+    /// Wait for a transfer through the relay (default) or P2P/tunnel.
     Receive {
         /// Output directory (default: current directory)
         #[arg(long, default_value = ".")]
@@ -102,11 +104,17 @@ enum Cmd {
         /// Overwrite existing files without warning
         #[arg(long)]
         overwrite: bool,
-        /// Use the v1 Cloudflare tunnel instead of the P2P (WebRTC) stack
+        /// Use the v1 Cloudflare tunnel instead of the relay
         #[arg(long)]
         tunnel: bool,
-        /// Rendezvous base URL (default: https://ntfy.sh)
-        #[arg(long)]
+        /// Relay URL override (default: config / B2P_RELAY)
+        #[arg(long, conflicts_with = "tunnel")]
+        relay: Option<String>,
+        /// Use the direct peer-to-peer WebRTC stack instead of the relay
+        #[arg(long, conflicts_with = "tunnel")]
+        p2p: bool,
+        /// Rendezvous base URL for --p2p (default: https://ntfy.sh)
+        #[arg(long, requires = "p2p")]
         rendezvous: Option<String>,
         #[command(flatten)]
         turn: TurnArgs,
@@ -121,8 +129,14 @@ enum Cmd {
         /// Send a text snippet instead of files
         #[arg(long, conflicts_with = "paths")]
         text: Option<String>,
-        /// Rendezvous base URL (default: https://ntfy.sh)
+        /// Relay URL override (default: config / B2P_RELAY / the code itself)
         #[arg(long)]
+        relay: Option<String>,
+        /// Use the direct peer-to-peer WebRTC stack instead of the relay
+        #[arg(long)]
+        p2p: bool,
+        /// Rendezvous base URL for --p2p (default: https://ntfy.sh)
+        #[arg(long, requires = "p2p")]
         rendezvous: Option<String>,
         #[command(flatten)]
         turn: TurnArgs,
@@ -173,22 +187,28 @@ async fn run() -> anyhow::Result<()> {
             yes,
             overwrite,
             tunnel,
+            relay,
+            p2p,
             rendezvous,
             turn,
         } => {
             if tunnel {
                 receive_tunnel(out, direct, yes, overwrite, &tls).await
-            } else {
+            } else if p2p {
                 receive_p1_cli(out, yes, overwrite, rendezvous, turn, &tls).await
+            } else {
+                receive_relay_cli(out, yes, overwrite, relay, &tls).await
             }
         }
         Cmd::Send {
             code,
             paths,
             text,
+            relay,
+            p2p,
             rendezvous,
             turn,
-        } => do_send(code, paths, text, rendezvous, turn, &tls).await,
+        } => do_send(code, paths, text, relay, p2p, rendezvous, turn, &tls).await,
         Cmd::Relay { cmd } => match cmd {
             RelayCmd::Set { url, token } => {
                 let url = b2p::transport::relay::normalize_relay_url(&url)?;
@@ -403,10 +423,88 @@ async fn receive_p1_cli(
     Ok(())
 }
 
+/// Default (P2b) receive path: everything through the operator's relay.
+/// One code, re-armed across sender retries — a dropped connection resumes
+/// from the staged chunks instead of restarting.
+async fn receive_relay_cli(
+    out: PathBuf,
+    yes: bool,
+    overwrite: bool,
+    relay_flag: Option<String>,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&out)?;
+    let cfg = b2p::config::load()?;
+    let relay = b2p::config::resolve_relay(
+        relay_flag.as_deref(),
+        None,
+        std::env::var("B2P_RELAY").ok().as_deref(),
+        std::env::var("B2P_RELAY_TOKEN").ok().as_deref(),
+        &cfg,
+    )?;
+    let code = b2p::rvcode::RendezvousCode::generate_human();
+    let host = relay
+        .url
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .to_string();
+    eprintln!("\nOn the other machine, run:\n");
+    println!("    b2p send {code} <files...>");
+    eprintln!("\n  or, if that machine has no relay configured:\n");
+    println!(
+        "    b2p send '{}' <files...>",
+        code.url_spelling(Some(&host))
+    );
+    eprintln!("\nWaiting for the sender... (Ctrl-C to abort)");
+
+    loop {
+        let out_for_accept = out.clone();
+        let accept =
+            move |m: &b2p::protocol::Manifest| accept_decision(m, &out_for_accept, yes, overwrite);
+        let attempt = b2p::session::receive_relay(
+            &relay.url,
+            relay.token.as_deref(),
+            &code.topic,
+            &code.secret.0,
+            &out,
+            accept,
+            tls,
+            WAIT_FOR_SENDER,
+            None,
+        )
+        .await;
+        match attempt {
+            Ok(desc) => {
+                eprintln!("via relay");
+                eprintln!("Done: {desc}");
+                return Ok(());
+            }
+            Err(e)
+                if e.downcast_ref::<b2p::transport::relay::TransportLost>()
+                    .is_some() =>
+            {
+                eprintln!(
+                    "connection lost ({e:#}) — the code is still valid; waiting for the sender to retry..."
+                );
+            }
+            Err(e) if e.downcast_ref::<b2p::handshake::CodeMismatch>().is_some() => {
+                eprintln!("a sender connected with a non-matching code — still waiting...");
+            }
+            Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
+                return connect_failed_relay(e, &relay, tls).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn do_send(
     code: String,
     paths: Vec<PathBuf>,
     text: Option<String>,
+    relay_flag: Option<String>,
+    p2p: bool,
     rendezvous: Option<String>,
     turn: TurnArgs,
     tls: &TlsOpts,
@@ -438,6 +536,48 @@ async fn do_send(
         }
     };
     match dest {
+        Dest::Rendezvous(rc) if !p2p => {
+            // Default (P2b): send through the relay.
+            let cfg = b2p::config::load()?;
+            let relay = b2p::config::resolve_relay(
+                relay_flag.as_deref(),
+                rc.relay_host.as_deref(),
+                std::env::var("B2P_RELAY").ok().as_deref(),
+                std::env::var("B2P_RELAY_TOKEN").ok().as_deref(),
+                &cfg,
+            )?;
+            let bar = match &source {
+                archive::Source::Blob { total_size, .. } => {
+                    Some(progress::transfer_bar(*total_size))
+                }
+                archive::Source::Text { .. } => None,
+            };
+            eprintln!("Waiting for the receiver...");
+            let desc = match b2p::session::send_relay(
+                &relay.url,
+                relay.token.as_deref(),
+                &rc.topic,
+                &rc.secret.0,
+                &source,
+                tls,
+                CONNECT_TIMEOUT,
+                bar.clone(),
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
+                    return connect_failed_relay(e, &relay, tls).await
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(b) = bar {
+                b.finish();
+            }
+            eprintln!("via relay");
+            eprintln!("Done: {desc}");
+            Ok(())
+        }
         Dest::Rendezvous(rc) => {
             let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
             let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
@@ -507,6 +647,27 @@ async fn do_send(
 /// right host. Note the doctor's rendezvous-*reachability* check is still
 /// hard-coded to ntfy.sh regardless of `--rendezvous` (a known limitation
 /// for custom rendezvous hosts — a follow-up; see src/doctor.rs).
+/// Relay-path variant of `connect_failed`. Task 11 threads the failing relay
+/// into the doctor's checks; until then this runs the generic report.
+async fn connect_failed_relay(
+    e: anyhow::Error,
+    relay: &b2p::config::RelayCfg,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
+    eprintln!("\nCould not connect: {e:#}");
+    eprintln!("Running diagnostics (b2p doctor)...\n");
+    let _ = relay;
+    let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
+        target_host: None,
+        cafile: tls.cafile.clone(),
+    })
+    .await;
+    eprintln!("{report}");
+    Err(anyhow::anyhow!(
+        "could not establish a connection (see diagnostics above)"
+    ))
+}
+
 async fn connect_failed(
     e: anyhow::Error,
     rendezvous_base: &str,
@@ -583,12 +744,16 @@ mod tests {
     #[test]
     fn turn_flags_validate() {
         use clap::Parser;
+        // the whole TURN family (and --rendezvous) now requires --p2p
+        assert!(Cli::try_parse_from(["b2p", "receive", "--turn", "turn:h:3478"]).is_err());
+        assert!(Cli::try_parse_from(["b2p", "receive", "--rendezvous", "https://x"]).is_err());
         // --turn-user requires --turn-pass
-        assert!(Cli::try_parse_from(["b2p", "receive", "--turn-user", "u"]).is_err());
+        assert!(Cli::try_parse_from(["b2p", "receive", "--p2p", "--turn-user", "u"]).is_err());
         // --turn-secret conflicts with static creds
         assert!(Cli::try_parse_from([
             "b2p",
             "receive",
+            "--p2p",
             "--turn-secret",
             "s",
             "--turn-user",
@@ -597,12 +762,13 @@ mod tests {
             "p"
         ])
         .is_err());
-        // valid: udp turn: + --turn-secret on send
+        // valid: udp turn: + --turn-secret on send (with --p2p)
         let cli = Cli::try_parse_from([
             "b2p",
             "send",
             "7-a-b",
             "f",
+            "--p2p",
             "--turn",
             "turn:h:3478",
             "--turn-secret",
@@ -618,6 +784,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "b2p",
             "receive",
+            "--p2p",
             "--turn",
             "turns:h:5349",
             "--turn-secret",
@@ -630,7 +797,8 @@ mod tests {
             panic!("expected receive");
         }
         // --turn with no creds fails at resolve()
-        let cli = Cli::try_parse_from(["b2p", "receive", "--turn", "turn:h:3478"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["b2p", "receive", "--p2p", "--turn", "turn:h:3478"]).unwrap();
         if let Cmd::Receive { turn, .. } = cli.cmd {
             assert!(turn.resolve().is_err());
         } else {
