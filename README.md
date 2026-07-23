@@ -1,15 +1,18 @@
 # b2p
 
-Encrypted file transfer between two PCs — like croc, but the only traffic the
-sender's network ever sees is a plain HTTPS upload.
+Encrypted file transfer between two PCs — peer-to-peer by default via WebRTC,
+with a Cloudflare tunnel fallback for restricted networks.
 
 ## How it works
 
-The **receiver** hosts a local HTTP server and exposes it through a free
-Cloudflare quick tunnel (an outbound connection — no port forwarding, no
-hosting, no account). The **sender** uploads the data as encrypted chunks with
-ordinary HTTPS requests. Everything is end-to-end encrypted with
-XChaCha20-Poly1305; the tunnel only ever carries ciphertext.
+The **receiver** and **sender** connect peer-to-peer over a WebRTC data channel,
+negotiated via a free ntfy.sh rendezvous service. A human-readable code derived
+from a SPAKE2 key exchange proves both sides know the transfer secret — no trusted
+server or account needed. Everything is end-to-end encrypted with
+XChaCha20-Poly1305; the rendezvous server only ever carries encrypted handshakes.
+
+For networks that block peer-to-peer: `--tunnel` on the receiver uses the old
+Cloudflare tunnel path (v1 compatibility).
 
 ## Usage
 
@@ -17,18 +20,22 @@ On the receiving machine:
 
     b2p receive
 
-It prints a one-time code like
-`https://tall-lion-radio.trycloudflare.com#hV8kPz3q...` — share it with the
-sender over any channel you trust. The part after `#` never travels over the
-network.
+It prints a one-time code like `7-otter-zebra` — share it with the sender over
+any channel you trust. The receiver waits for a peer-to-peer connection and
+shows `via WebRTC (STUN)` once connected.
 
 On the sending machine:
 
-    b2p send '<code>' path/to/file-or-folder
-    b2p send '<code>' --text "the wifi password is hunter2"
+    b2p send '7-otter-zebra' path/to/file-or-folder
+    b2p send '7-otter-zebra' --text "the wifi password is hunter2"
+
+The sender detects the code type and connects accordingly. Codes from older v1
+releases (`https://…#…`) automatically use the Cloudflare tunnel path.
 
 Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
-`--overwrite`, `--direct` (same-LAN mode, no tunnel), `--cafile FILE` (extra root CA, both commands).
+`--overwrite`, `--tunnel` (use Cloudflare tunnel instead of WebRTC),
+`--rendezvous <URL>` (override signaling host; default `https://ntfy.sh`),
+`--cafile FILE` (extra root CA, both commands).
 
 ## Resume
 
@@ -47,18 +54,15 @@ verdict. `b2p send` runs it automatically when it cannot reach the receiver.
 
 ## Notes
 
-- First `receive` run downloads a pinned, checksum-verified `cloudflared`
-  binary into the b2p data directory.
 - b2p trusts the operating system's certificate store (plus `SSL_CERT_FILE` /
-  `SSL_CERT_DIR` / `--cafile`), so networks that run TLS inspection work as
-  long as the proxy's root CA is installed — `b2p doctor` tells you if it isn't.
-- The sender uses the system resolver. If a network DNS-blocks the tunnel
-  domain, `b2p doctor` names the block and suggests alternatives (v2 will add
-  transports that don't depend on a single domain).
+  `SSL_CERT_DIR` / `--cafile`) for the rendezvous service; networks with TLS
+  inspection work as long as the proxy's root CA is installed. `b2p doctor`
+  verifies all layers (DNS, TLS, UDP, HTTPS).
+- If WebRTC is blocked, use `receive --tunnel` to fall back to the Cloudflare
+  path. The sender auto-detects the code type.
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
-- `cargo test` runs the full offline test suite; `scripts/smoke-tunnel.sh`
-  exercises a real tunnel.
+- `cargo test` runs the full offline test suite.
 
 ## Development
 
