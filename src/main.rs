@@ -32,6 +32,14 @@ fn default_ice_servers() -> Vec<b2p::turn::IceServer> {
     }]
 }
 
+/// STUN defaults plus any resolved TURN servers. Errors if `--turn` was given
+/// without a credential mode.
+fn ice_servers(turn: &TurnArgs) -> anyhow::Result<Vec<b2p::turn::IceServer>> {
+    let mut servers = default_ice_servers();
+    servers.extend(turn.resolve()?);
+    Ok(servers)
+}
+
 #[derive(Parser)]
 #[command(name = "b2p", version, about = "Encrypted peer-to-peer file transfer")]
 struct Cli {
@@ -40,6 +48,43 @@ struct Cli {
     cafile: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// TURN relay flags shared by `receive` and `send` (design §4). With no flags,
+/// the transport stays STUN-only. Only the peer that allocates a relay needs
+/// credentials (design §3.1), so either peer may set these independently.
+#[derive(clap::Args, Clone)]
+struct TurnArgs {
+    /// TURN relay URL (turn:/turns:); repeat for several. Needs --turn-secret or --turn-user/--turn-pass.
+    #[arg(long = "turn")]
+    turn: Vec<String>,
+    /// coturn use-auth-secret shared secret; b2p mints a short-lived credential.
+    #[arg(long, conflicts_with_all = ["turn_user", "turn_pass", "turn_public"])]
+    turn_secret: Option<String>,
+    /// Static TURN username (requires --turn-pass).
+    #[arg(long, requires = "turn_pass", conflicts_with_all = ["turn_secret", "turn_public"])]
+    turn_user: Option<String>,
+    /// Static TURN password (requires --turn-user).
+    #[arg(long, requires = "turn_user", conflicts_with_all = ["turn_secret", "turn_public"])]
+    turn_pass: Option<String>,
+    /// Use a bundled best-effort free relay (Open Relay). Opt-in; may be unreliable.
+    #[arg(long, conflicts_with_all = ["turn", "turn_secret", "turn_user", "turn_pass"])]
+    turn_public: bool,
+}
+
+impl TurnArgs {
+    fn resolve(&self) -> anyhow::Result<Vec<b2p::turn::IceServer>> {
+        // Random nonce disambiguates concurrent coturn allocations.
+        let nonce = format!("{:08x}", rand::random::<u32>());
+        b2p::turn::resolve(
+            &self.turn,
+            self.turn_secret.as_deref(),
+            self.turn_user.as_deref(),
+            self.turn_pass.as_deref(),
+            self.turn_public,
+            &nonce,
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -64,6 +109,8 @@ enum Cmd {
         /// Rendezvous base URL (default: https://ntfy.sh)
         #[arg(long)]
         rendezvous: Option<String>,
+        #[command(flatten)]
+        turn: TurnArgs,
     },
     /// Send files, folders, or text to a waiting receiver.
     Send {
@@ -78,6 +125,8 @@ enum Cmd {
         /// Rendezvous base URL (default: https://ntfy.sh)
         #[arg(long)]
         rendezvous: Option<String>,
+        #[command(flatten)]
+        turn: TurnArgs,
     },
     /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
     Doctor {
@@ -107,11 +156,12 @@ async fn run() -> anyhow::Result<()> {
             overwrite,
             tunnel,
             rendezvous,
+            turn,
         } => {
             if tunnel {
                 receive_tunnel(out, direct, yes, overwrite, &tls).await
             } else {
-                receive_p1_cli(out, yes, overwrite, rendezvous, &tls).await
+                receive_p1_cli(out, yes, overwrite, rendezvous, turn, &tls).await
             }
         }
         Cmd::Send {
@@ -119,7 +169,8 @@ async fn run() -> anyhow::Result<()> {
             paths,
             text,
             rendezvous,
-        } => do_send(code, paths, text, rendezvous, &tls).await,
+            turn,
+        } => do_send(code, paths, text, rendezvous, turn, &tls).await,
         Cmd::Doctor { target } => {
             let target_host = target.as_deref().map(parse_target).transpose()?;
             let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
@@ -262,9 +313,12 @@ async fn receive_p1_cli(
     yes: bool,
     overwrite: bool,
     rendezvous: Option<String>,
+    turn: TurnArgs,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
+    // Resolve ICE servers early so a bad --turn combo fails before we print a code.
+    let ice = ice_servers(&turn)?;
     let code = b2p::rvcode::RendezvousCode::generate_human();
     eprintln!("\nOn the other machine, run:\n");
     println!("    b2p send {code} <files...>\n");
@@ -273,7 +327,6 @@ async fn receive_p1_cli(
     let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
     let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
         Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-    let ice = default_ice_servers();
     let out_for_accept = out.clone();
     let accept =
         move |m: &b2p::protocol::Manifest| accept_decision(m, &out_for_accept, yes, overwrite);
@@ -299,7 +352,7 @@ async fn receive_p1_cli(
         }
         Err(e) => return Err(e),
     };
-    eprintln!("via WebRTC (STUN)");
+    eprintln!("via WebRTC");
     eprintln!("Done: {desc}");
     Ok(())
 }
@@ -309,6 +362,7 @@ async fn do_send(
     paths: Vec<PathBuf>,
     text: Option<String>,
     rendezvous: Option<String>,
+    turn: TurnArgs,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
     // Classify/parse the code BEFORE `archive::prepare`, which can tar a
@@ -335,7 +389,7 @@ async fn do_send(
             let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
             let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
                 Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-            let ice = default_ice_servers();
+            let ice = ice_servers(&turn)?;
             let bar = match &source {
                 archive::Source::Blob { total_size, .. } => {
                     Some(progress::transfer_bar(*total_size))
@@ -366,7 +420,7 @@ async fn do_send(
             if let Some(b) = bar {
                 b.finish();
             }
-            eprintln!("via WebRTC (STUN)");
+            eprintln!("via WebRTC");
             eprintln!("Done: {desc}");
             Ok(())
         }
@@ -472,6 +526,27 @@ mod tests {
         assert!(!b2p::rvcode::is_rendezvous_code(
             "https://x.trycloudflare.com#abc"
         ));
+    }
+
+    #[test]
+    fn turn_flags_validate() {
+        use clap::Parser;
+        // --turn-public conflicts with --turn-secret
+        assert!(Cli::try_parse_from(["b2p", "receive", "--turn-public", "--turn-secret", "s"]).is_err());
+        // --turn-user requires --turn-pass
+        assert!(Cli::try_parse_from(["b2p", "receive", "--turn-user", "u"]).is_err());
+        // valid: --turn + --turn-secret on send
+        assert!(Cli::try_parse_from([
+            "b2p", "send", "7-a-b", "f", "--turn", "turns:h:443?transport=tcp", "--turn-secret", "s"
+        ])
+        .is_ok());
+        // --turn with no creds parses at clap level but fails at resolve()
+        let cli = Cli::try_parse_from(["b2p", "receive", "--turn", "turn:h:3478"]).unwrap();
+        if let Cmd::Receive { turn, .. } = cli.cmd {
+            assert!(turn.resolve().is_err());
+        } else {
+            panic!("expected receive");
+        }
     }
 
     #[test]
