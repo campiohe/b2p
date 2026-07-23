@@ -7,6 +7,20 @@ use b2p::{archive, progress, send, server, tunnel};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// STUN servers offered to the WebRTC ICE agent for the P1 (default) stack.
+const STUN_SERVERS: [&str; 2] = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478",
+];
+/// Default rendezvous service (ntfy.sh) used to run the PAKE handshake and
+/// exchange SDP/ICE for the P1 stack.
+const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
+/// How long to wait for the WebRTC connection to form before giving up and
+/// running the doctor.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
 #[command(
@@ -24,12 +38,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for a transfer: host the server, open a tunnel, print the code.
+    /// Wait for a transfer over the peer-to-peer (WebRTC) stack by default.
     Receive {
         /// Output directory (default: current directory)
         #[arg(long, default_value = ".")]
         out: PathBuf,
-        /// Skip the tunnel and serve directly on the LAN
+        /// Skip the tunnel and serve directly on the LAN (--tunnel only)
         #[arg(long)]
         direct: bool,
         /// Accept the incoming transfer without prompting
@@ -38,6 +52,12 @@ enum Cmd {
         /// Overwrite existing files without warning
         #[arg(long)]
         overwrite: bool,
+        /// Use the v1 Cloudflare tunnel instead of the P2P (WebRTC) stack
+        #[arg(long)]
+        tunnel: bool,
+        /// Rendezvous base URL (default: https://ntfy.sh)
+        #[arg(long)]
+        rendezvous: Option<String>,
     },
     /// Send files, folders, or text to a waiting receiver.
     Send {
@@ -49,6 +69,9 @@ enum Cmd {
         /// Send a text snippet instead of files
         #[arg(long, conflicts_with = "paths")]
         text: Option<String>,
+        /// Rendezvous base URL (default: https://ntfy.sh)
+        #[arg(long)]
+        rendezvous: Option<String>,
     },
     /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
     Doctor {
@@ -76,8 +99,21 @@ async fn run() -> anyhow::Result<()> {
             direct,
             yes,
             overwrite,
-        } => receive(out, direct, yes, overwrite, &tls).await,
-        Cmd::Send { code, paths, text } => do_send(code, paths, text, &tls).await,
+            tunnel,
+            rendezvous,
+        } => {
+            if tunnel {
+                receive_tunnel(out, direct, yes, overwrite, &tls).await
+            } else {
+                receive_p1_cli(out, yes, overwrite, rendezvous, &tls).await
+            }
+        }
+        Cmd::Send {
+            code,
+            paths,
+            text,
+            rendezvous,
+        } => do_send(code, paths, text, rendezvous, &tls).await,
         Cmd::Doctor { target } => {
             let target_host = target.as_deref().map(parse_target).transpose()?;
             let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
@@ -91,7 +127,7 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-async fn receive(
+async fn receive_tunnel(
     out: PathBuf,
     direct: bool,
     yes: bool,
@@ -168,13 +204,101 @@ async fn receive(
     Ok(())
 }
 
+/// Decide whether to accept an incoming transfer. `--yes` skips the prompt
+/// (still refusing a `Kind::File` clobber unless `--overwrite`); otherwise it
+/// prints a summary and reads y/N from stdin.
+fn accept_decision(
+    m: &b2p::protocol::Manifest,
+    out_dir: &std::path::Path,
+    yes: bool,
+    overwrite: bool,
+) -> bool {
+    use b2p::protocol::Kind;
+    let clobber = m.kind == Kind::File
+        && out_dir
+            .join(
+                std::path::Path::new(&m.name)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+            .exists();
+    if yes {
+        return !(clobber && !overwrite);
+    }
+    let summary = match m.kind {
+        Kind::Text => "Incoming text snippet".to_string(),
+        _ => format!(
+            "Incoming: {} file(s), {} bytes total",
+            m.entries.len(),
+            m.total_size
+        ),
+    };
+    eprintln!("\n{summary}");
+    if clobber {
+        eprintln!("  WARNING: destination file exists and will be overwritten");
+    }
+    eprint!("Accept? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    line.trim().eq_ignore_ascii_case("y")
+}
+
+/// P1 (default) receive path: PAKE handshake + WebRTC transport over the
+/// rendezvous service, no tunnel or local server involved. A live
+/// byte-accurate progress bar is deferred to a follow-up — this prints
+/// status lines instead of animating one.
+async fn receive_p1_cli(
+    out: PathBuf,
+    yes: bool,
+    overwrite: bool,
+    rendezvous: Option<String>,
+    tls: &TlsOpts,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&out)?;
+    let code = b2p::rvcode::RendezvousCode::generate_human();
+    eprintln!("\nOn the other machine, run:\n");
+    println!("    b2p send {code} <files...>\n");
+    eprintln!("Waiting for the sender...");
+
+    let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
+    let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
+        Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
+    let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+    let out_for_accept = out.clone();
+    let accept =
+        move |m: &b2p::protocol::Manifest| accept_decision(m, &out_for_accept, yes, overwrite);
+
+    let desc = match b2p::session::receive_p1(
+        rv,
+        &code.topic,
+        &code.secret.0,
+        &out,
+        accept,
+        &stun,
+        CONNECT_TIMEOUT,
+        None,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return connect_failed(e, &code.topic, tls).await,
+    };
+    eprintln!("via WebRTC (STUN)");
+    eprintln!("Done: {desc}");
+    Ok(())
+}
+
 async fn do_send(
     code: String,
     paths: Vec<PathBuf>,
     text: Option<String>,
+    rendezvous: Option<String>,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
-    let code = Code::parse(&code).context("invalid code — paste it exactly as printed")?;
     let source = match &text {
         Some(t) => archive::prepare_text(t),
         None => {
@@ -182,17 +306,60 @@ async fn do_send(
             archive::prepare(&paths)?
         }
     };
-    let bar = match &source {
-        archive::Source::Blob { total_size, .. } => Some(progress::transfer_bar(*total_size)),
-        archive::Source::Text { .. } => None,
-    };
-    eprintln!("Waiting for the receiver to accept...");
-    let desc = send::send(&code, source, bar.clone(), tls).await?;
-    if let Some(b) = bar {
-        b.finish();
+    if b2p::rvcode::is_rendezvous_code(&code) {
+        let rc = b2p::rvcode::parse(&code).context("invalid code")?;
+        let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
+        let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
+            Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
+        let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+        eprintln!("Waiting for the receiver...");
+        let desc = match b2p::session::send_p1(
+            rv,
+            &rc.topic,
+            &rc.secret.0,
+            &source,
+            &stun,
+            CONNECT_TIMEOUT,
+            None,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => return connect_failed(e, &rc.topic, tls).await,
+        };
+        eprintln!("via WebRTC (STUN)");
+        eprintln!("Done: {desc}");
+        Ok(())
+    } else {
+        // v1 tunnel code
+        let code = Code::parse(&code).context("invalid code — paste it exactly as printed")?;
+        let bar = match &source {
+            archive::Source::Blob { total_size, .. } => Some(progress::transfer_bar(*total_size)),
+            archive::Source::Text { .. } => None,
+        };
+        eprintln!("Waiting for the receiver to accept...");
+        let desc = send::send(&code, source, bar.clone(), tls).await?;
+        if let Some(b) = bar {
+            b.finish();
+        }
+        eprintln!("Done: {desc}");
+        Ok(())
     }
-    eprintln!("Done: {desc}");
-    Ok(())
+}
+
+/// Run on a P1 connect failure (design §6): print the error, run the doctor,
+/// and surface both to the user before returning the original error.
+async fn connect_failed(e: anyhow::Error, topic: &str, tls: &TlsOpts) -> anyhow::Result<()> {
+    eprintln!("\nCould not connect: {e:#}");
+    eprintln!("Running diagnostics (b2p doctor)...\n");
+    let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
+        target_host: None,
+        cafile: tls.cafile.clone(),
+    })
+    .await;
+    eprintln!("{report}");
+    let _ = topic;
+    Err(e)
 }
 
 fn parse_target(s: &str) -> anyhow::Result<String> {
@@ -235,5 +402,41 @@ mod tests {
         );
         assert_eq!(parse_target("example.com").unwrap(), "example.com");
         assert!(parse_target("http://#nope").is_err());
+    }
+
+    #[test]
+    fn dispatch_picks_transport_by_code_form() {
+        // human + b2p:// codes → rendezvous (P1); https:// → tunnel (P0)
+        assert!(b2p::rvcode::is_rendezvous_code("7-otter-zebra"));
+        assert!(b2p::rvcode::is_rendezvous_code("b2p://topic#secret"));
+        assert!(!b2p::rvcode::is_rendezvous_code(
+            "https://x.trycloudflare.com#abc"
+        ));
+    }
+
+    #[test]
+    fn accept_decision_honors_yes_and_clobber() {
+        use b2p::protocol::{Entry, Kind, Manifest, PROTOCOL_VERSION};
+        let dir = tempfile::tempdir().unwrap();
+        let m = Manifest {
+            version: PROTOCOL_VERSION,
+            transfer_id: "t".into(),
+            kind: Kind::File,
+            name: "f.bin".into(),
+            entries: vec![Entry {
+                path: "f.bin".into(),
+                size: 4,
+            }],
+            total_size: 4,
+            chunk_size: 16 * 1024,
+            text: None,
+        };
+        // --yes, no existing file → accept
+        assert!(accept_decision(&m, dir.path(), true, false));
+        // --yes but destination exists and no --overwrite → decline
+        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
+        assert!(!accept_decision(&m, dir.path(), true, false));
+        // --yes + --overwrite → accept despite existing
+        assert!(accept_decision(&m, dir.path(), true, true));
     }
 }
