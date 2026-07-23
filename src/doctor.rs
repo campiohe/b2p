@@ -21,6 +21,9 @@ pub struct DoctorArgs {
     /// Host to test at the DNS layer (from a code, or DEFAULT_TARGET).
     pub target_host: Option<String>,
     pub cafile: Option<PathBuf>,
+    /// Relay to probe (wss://…), when one is configured or being debugged.
+    pub relay: Option<String>,
+    pub relay_token: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,7 +34,7 @@ pub enum Outcome {
 }
 
 pub struct Check {
-    /// Stable id used by verdict logic: "dns" | "tls" | "stun" | "rendezvous".
+    /// Stable id used by verdict logic: "dns" | "tls" | "stun" | "rendezvous" | "relay".
     pub name: &'static str,
     /// Human-facing line prefix, e.g. "DNS (trycloudflare.com)".
     pub label: String,
@@ -69,9 +72,44 @@ pub async fn run(args: &DoctorArgs) -> DoctorReport {
         stun_check(),
         rendezvous_check(&tls, RENDEZVOUS_HEALTH),
     );
-    let checks = vec![dns, tls_c, stun, rendezvous];
+    let mut checks = vec![dns, tls_c, stun, rendezvous];
+    if let Some(url) = &args.relay {
+        checks.push(relay_check(url, args.relay_token.as_deref(), &tls).await);
+    }
     let verdict = verdict(&checks, target);
     DoctorReport { checks, verdict }
+}
+
+/// WSS connect + ping/pong round-trip against the configured relay, on a
+/// throwaway room. The one check that exercises the default transport's
+/// actual path (TLS + WebSocket upgrade + Worker + Durable Object).
+pub(crate) async fn relay_check(url: &str, token: Option<&str>, tls: &TlsOpts) -> Check {
+    let label = format!("relay ({url})");
+    let bounded = tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::transport::relay::probe(url, token, tls),
+    )
+    .await;
+    match bounded {
+        Ok(Ok(())) => Check {
+            name: "relay",
+            label,
+            outcome: Outcome::Ok,
+            detail: "WebSocket connect + ping round-trip OK".into(),
+        },
+        Ok(Err(e)) => Check {
+            name: "relay",
+            label,
+            outcome: Outcome::Fail,
+            detail: format!("{e:#}"),
+        },
+        Err(_) => Check {
+            name: "relay",
+            label,
+            outcome: Outcome::Fail,
+            detail: "timed out probing the relay".into(),
+        },
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -272,6 +310,12 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
                 root CA to the OS trust store, or pass --cafile / set SSL_CERT_FILE"
             .into();
     }
+    if failed("relay") {
+        return "the relay is unreachable — default transfers cannot proceed; check the URL \
+                (b2p relay show) and that the worker is deployed (npx wrangler deploy in \
+                relay-worker/)"
+            .into();
+    }
     if failed("rendezvous") {
         return "HTTPS egress looks restricted (the rendezvous host is unreachable) — \
                 transfers may still work if the tunnel host is reachable; otherwise use \
@@ -284,9 +328,19 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
         .iter()
         .any(|c| c.name == "stun" && c.outcome == Outcome::Warn && c.detail.contains("symmetric"))
     {
-        return "every layer is clean, but this network's NAT is symmetric — direct WebRTC to \
-                another NAT'd peer will likely fail. Use a TURN relay (--turn), --tunnel, or put \
-                both peers on the same LAN"
+        if checks
+            .iter()
+            .any(|c| c.name == "relay" && c.outcome == Outcome::Ok)
+        {
+            return "this network's NAT is symmetric — direct P2P (--p2p) would likely fail, \
+                    but the default relay transport is unaffected and reachable; transfers \
+                    should work"
+                .into();
+        }
+        return "every layer is clean, but this network's NAT is symmetric — direct WebRTC \
+                (--p2p) to another NAT'd peer will likely fail. The default relay transport is \
+                unaffected (configure one: b2p relay set); for P2P use a TURN relay (--turn), \
+                --tunnel, or put both peers on the same LAN"
             .into();
     }
     "no blockers found — DNS, TLS, and HTTPS reachability look clean".into()
@@ -315,6 +369,22 @@ mod tests {
         assert_eq!(classify_ips(&[loopback]), DnsClass::Sinkhole(loopback));
         // any bad answer taints the set, wherever it appears
         assert_eq!(classify_ips(&[clean, block]), DnsClass::BlockPage(block));
+    }
+
+    #[tokio::test]
+    async fn relay_check_against_mock() {
+        let relay = crate::transport::mock::start().await;
+        let c = relay_check(&relay.url, None, &TlsOpts::default()).await;
+        assert!(matches!(c.outcome, Outcome::Ok), "detail: {}", c.detail);
+        let dead = relay_check("ws://127.0.0.1:9", None, &TlsOpts::default()).await;
+        assert!(matches!(dead.outcome, Outcome::Fail));
+    }
+
+    #[test]
+    fn relay_failure_dominates_verdict() {
+        let checks = vec![check("dns", Outcome::Ok), check("relay", Outcome::Fail)];
+        let v = verdict(&checks, "trycloudflare.com");
+        assert!(v.contains("relay"), "got: {v}");
     }
 
     #[test]

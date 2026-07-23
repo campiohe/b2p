@@ -239,9 +239,27 @@ async fn run() -> anyhow::Result<()> {
         },
         Cmd::Doctor { target } => {
             let target_host = target.as_deref().map(parse_target).transpose()?;
+            // Probe the configured relay too, when there is one — resolution
+            // errors here just mean "no relay yet", not a doctor failure.
+            let relay_cfg = b2p::config::load().ok().and_then(|cfg| {
+                b2p::config::resolve_relay(
+                    None,
+                    None,
+                    std::env::var("B2P_RELAY").ok().as_deref(),
+                    std::env::var("B2P_RELAY_TOKEN").ok().as_deref(),
+                    &cfg,
+                )
+                .ok()
+            });
+            let (relay, relay_token) = match relay_cfg {
+                Some(r) => (Some(r.url), r.token),
+                None => (None, None),
+            };
             let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
                 target_host,
                 cafile: cli.cafile.clone(),
+                relay,
+                relay_token,
             })
             .await;
             println!("{report}");
@@ -647,8 +665,8 @@ async fn do_send(
 /// right host. Note the doctor's rendezvous-*reachability* check is still
 /// hard-coded to ntfy.sh regardless of `--rendezvous` (a known limitation
 /// for custom rendezvous hosts — a follow-up; see src/doctor.rs).
-/// Relay-path variant of `connect_failed`. Task 11 threads the failing relay
-/// into the doctor's checks; until then this runs the generic report.
+/// Relay-path variant of `connect_failed`: the doctor probes the failing
+/// relay itself, so the report names the actual blocker.
 async fn connect_failed_relay(
     e: anyhow::Error,
     relay: &b2p::config::RelayCfg,
@@ -656,10 +674,11 @@ async fn connect_failed_relay(
 ) -> anyhow::Result<()> {
     eprintln!("\nCould not connect: {e:#}");
     eprintln!("Running diagnostics (b2p doctor)...\n");
-    let _ = relay;
     let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
         target_host: None,
         cafile: tls.cafile.clone(),
+        relay: Some(relay.url.clone()),
+        relay_token: relay.token.clone(),
     })
     .await;
     eprintln!("{report}");
@@ -681,6 +700,8 @@ async fn connect_failed(
     let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
         target_host: host,
         cafile: tls.cafile.clone(),
+        relay: None,
+        relay_token: None,
     })
     .await;
     eprintln!("{report}");

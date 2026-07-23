@@ -161,6 +161,8 @@ async fn connect_failure(
         let report = crate::doctor::run(&crate::doctor::DoctorArgs {
             target_host: Some(host.clone()),
             cafile: tls.cafile.clone(),
+            relay: None,
+            relay_token: None,
         })
         .await;
         eprintln!("{report}");
