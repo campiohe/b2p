@@ -68,7 +68,7 @@ pub const WORDS: [&str; 256] = [
     "fiddle",
     "fjord",
     "flamingo",
-    "fluate",
+    "flute",
     "forest",
     "fountain",
     "foxglove",

@@ -226,7 +226,11 @@ mod tests {
         assert!(parse("b2p://#deadbeef").is_err()); // empty topic
         assert!(parse("b2p://sometopic#").is_err()); // empty secret
         assert!(parse("https://x.com#abc").is_err()); // not a rendezvous code (that's a tunnel code)
-        assert!(parse("b2p://../admin#3yZe7B4vN9pQ2sKfTgWxUm").is_err()); // topic not valid 16-byte base58
+        assert!(parse("b2p://../admin#3yZe7B4vN9pQ2sKfTgWxUm").is_err()); // topic not valid base58 at all
+                                                                          // valid base58 topic but wrong length (8 bytes, not 16) — exercises the length check itself
+        let short_topic = bs58::encode([9u8; 8]).into_string();
+        let good_secret = bs58::encode([7u8; 16]).into_string();
+        assert!(parse(&format!("b2p://{short_topic}#{good_secret}")).is_err());
         let valid = RendezvousCode::generate_url().to_string();
         let (valid_topic, _) = valid
             .strip_prefix("b2p://")
