@@ -6,15 +6,33 @@ spec phase they belong to. See `b2p-v2-spec.md` and
 
 ## P2 — relay + TURN + negotiation
 
-- [ ] **Self-hostable relay + signaling binary** (`b2p relay`) — HTTPS PUT/GET
-      store-and-forward; the reference relay both peers can reach over ordinary
-      HTTPS when live P2P can't form. Sees only ciphertext + an opaque id. **Now
-      also the answer for UDP-blocked networks** (TURN-over-TLS is unavailable —
-      see the P2a shipped note below), so this is the next P2 sub-phase.
-- [ ] **`Transport` trait + negotiation engine** — `src/transport/mod.rs` is
-      currently just `pub mod webrtc;`. Add the trait (design §4.1) and the
-      per-stage-budget negotiation (design §5) so LAN / WebRTC / relay are tried
-      in order instead of chosen only by code form.
+- [x] **P2b: always-relay transport via Cloudflare Worker** — SHIPPED. The
+      default path now runs entirely through a self-deployed Worker
+      (`relay-worker/`): WSS 443, DO room pairing, PAKE in-band, e2e flow
+      control, real resume, `b2p relay set` config, relay-host-embedding
+      codes, doctor probe. See
+      `docs/superpowers/specs/2026-07-23-b2p-v2-p2b-relay-design.md` (+
+      as-built notes) and
+      `docs/superpowers/plans/2026-07-23-b2p-v2-p2b-relay.md`. Field failures
+      that drove the redesign: CGNAT/symmetric far sides + UDP-blocked
+      networks defeated WebRTC/TURN/tunnel everywhere the user tried v0.3.0.
+- [ ] **`Transport` trait + negotiation engine** — deferred: with the relay as
+      the sole default transport there is nothing to negotiate; revisit if
+      LAN-direct (P3) lands and ordering matters again.
+
+### P2b deferred follow-ups
+
+- [ ] **Custom-domain recipe** for networks that category-block
+      `*.workers.dev` (attach a domain to the Worker; doc + doctor hint).
+- [ ] **HTTP CONNECT proxy support** for corporate proxies that require
+      explicit proxy configuration (doctor at least names the failure today).
+- [ ] **Receiver-side progress bar / status lines** on the relay path
+      (receive_relay passes `progress: None` today, like P1).
+- [ ] **Decide the WebRTC/ntfy/TURN stack's fate** (`--p2p`) once relay
+      reliability is field-confirmed — keep as opt-in or delete and shrink
+      the binary.
+- [ ] **Store-and-forward via R2** (P3) — receiver can be offline; rooms
+      currently require both peers live.
 
 ### P2a shipped (UDP TURN + SCTP stall guard); deferred follow-ups
 

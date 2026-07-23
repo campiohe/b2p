@@ -7,8 +7,35 @@ an HTTPS connection". WebRTC moves behind an opt-in flag; `--tunnel` is
 untouched. This is the "self-hostable relay" the P2 backlog called for, with a
 Worker instead of a VPS binary as the reference host.*
 
-Status: **Approved design** · Companion to `b2p-v2-spec.md` (§4 T2, §5) and
-`docs/superpowers/specs/2026-07-23-b2p-v2-p2a-turn-design.md`.
+Status: **Implemented (as-built)** · Companion to `b2p-v2-spec.md` (§4 T2, §5)
+and `docs/superpowers/specs/2026-07-23-b2p-v2-p2a-turn-design.md`. Plan:
+`docs/superpowers/plans/2026-07-23-b2p-v2-p2b-relay.md`.
+
+> **As-built notes (implementation refinements, all verified by tests):**
+> 1. PAKE-in-band is `handshake::handshake_over_channel()` reusing `pake.rs`
+>    and the existing frame encoding directly over `MsgChannel` — no
+>    `Rendezvous` adapter (§2 as-specced). Same outcome, less machinery. A
+>    wrong-code sender surfaces as a typed `CodeMismatch` the receiver's loop
+>    re-arms on.
+> 2. Room id = `RendezvousCode.topic` verbatim — already channel-only for
+>    human codes / independently random for URL codes, which is exactly the
+>    security property §4's new HKDF domain was for. No new derivation.
+> 3. The Worker rejects bad joins with plain HTTP statuses (401/409/400)
+>    before the upgrade instead of a `{"t":"error"}` control message; the
+>    client maps them to actionable errors at dial time.
+> 4. Binary framing supports splitting one logical frame across WS messages
+>    (a continuation bit in the `u32` sub-frame header), so a huge `Manifest`
+>    (10k-file folder) or resume ack can never hit Workers' 1 MiB message
+>    cap. Batching is write-behind: immediate when the socket is idle,
+>    coalesced (≤960 KiB) when it's busy.
+> 5. Resume uses a NEW `protocol::StreamManifestAck` with run-length
+>    `have_runs: Vec<(start, len)>` — the tunnel path's `ManifestAck` wire
+>    format stays frozen (it is also v1's HTTP ack). Mixed-version `--p2p`
+>    peers therefore fail the manifest ack parse; both sides should run the
+>    same version (the default relay path already requires that).
+> 6. Config uses the already-present `directories` crate (not `dirs`);
+>    doctor's symmetric-NAT verdict now points at the relay default rather
+>    than `--turn`, and notes when the configured relay is reachable.
 
 ---
 

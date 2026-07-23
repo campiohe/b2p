@@ -1,18 +1,50 @@
 # b2p
 
-Encrypted file transfer between two PCs — peer-to-peer by default via WebRTC,
-with a Cloudflare tunnel fallback for restricted networks.
+Encrypted file transfer between two PCs that works on real-world networks —
+every transfer travels through a tiny relay you deploy once, for free, on
+Cloudflare Workers. Both machines only ever make an ordinary outbound
+HTTPS/WebSocket connection on port 443, the same thing opening a web page
+needs, so CGNAT, symmetric NAT, UDP-blocking firewalls, and DNS filtering
+don't matter.
 
 ## How it works
 
-The **receiver** and **sender** connect peer-to-peer over a WebRTC data channel,
-negotiated via a free ntfy.sh rendezvous service. A human-readable code derived
-from a SPAKE2 key exchange proves both sides know the transfer secret — no trusted
-server or account needed. Everything is end-to-end encrypted with
-XChaCha20-Poly1305; the rendezvous server only ever carries encrypted handshakes.
+The **receiver** prints a one-time code. Both sides derive a room id from it
+and dial your relay; the relay's only job is to pair the two connections and
+forward bytes — it sees ciphertext only. A SPAKE2 key exchange over that pipe
+proves both sides know the code, then the file streams end-to-end encrypted
+with XChaCha20-Poly1305. Interrupted transfers resume from the staged chunks
+instead of restarting.
 
-For networks that block peer-to-peer: `--tunnel` on the receiver uses the old
-Cloudflare tunnel path (v1 compatibility).
+## Quick install
+
+Download a prebuilt binary from the
+[latest release](https://github.com/campiohe/b2p/releases) — Linux (static
+musl), macOS (Apple Silicon), or Windows (`b2p.exe`) — and put it on your
+`PATH`. No runtime dependencies.
+
+## Deploy your relay (free, ~5 minutes, once)
+
+The relay is a ~100-line Cloudflare Worker in `relay-worker/`. You need a free
+Cloudflare account and Node.js:
+
+    cd relay-worker
+    npx wrangler login          # opens the browser once
+    npx wrangler deploy         # prints https://b2p-relay.<account>.workers.dev
+
+Optionally restrict it to holders of a shared token:
+
+    npx wrangler secret put RELAY_TOKEN
+
+Then, on each machine that will use b2p:
+
+    b2p relay set wss://b2p-relay.<account>.workers.dev [--token <T>]
+
+(`--relay <url>` and the `B2P_RELAY` / `B2P_RELAY_TOKEN` env vars override the
+config file; `b2p relay show` prints it.)
+
+The free tier comfortably covers personal use — dozens of multi-GB transfers a
+day; the relay never stores data.
 
 ## Usage
 
@@ -20,69 +52,66 @@ On the receiving machine:
 
     b2p receive
 
-It prints a one-time code like `7-otter-zebra` — share it with the sender over
-any channel you trust. The receiver waits for a peer-to-peer connection and
-shows `via WebRTC (STUN)` once connected.
+It prints the code two ways: a short human code like `7-otter-zebra` (works
+when the sender has the same relay configured) and a long `b2p://…` form that
+**embeds the relay address**, so a freshly-installed sender needs no
+configuration at all. Share either over any channel you trust.
 
 On the sending machine:
 
     b2p send '7-otter-zebra' path/to/file-or-folder
+    b2p send 'b2p://b2p-relay.you.workers.dev/…#…' path/to/file
     b2p send '7-otter-zebra' --text "the wifi password is hunter2"
 
-The sender detects the code type and connects accordingly. Codes from older v1
-releases (`https://…#…`) automatically use the Cloudflare tunnel path.
-
 Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
-`--overwrite`, `--tunnel` (use Cloudflare tunnel instead of WebRTC),
-`--direct` (with `--tunnel`: serve directly on the LAN, skipping cloudflared),
-`--rendezvous <URL>` (override signaling host; default `https://ntfy.sh`),
-`--cafile FILE` (extra root CA, both commands),
-`--turn turn:HOST:PORT` (UDP TURN relay for symmetric NAT) with `--turn-secret S`
-or `--turn-user U`/`--turn-pass P` (both commands).
+`--overwrite`, `--relay URL` (override the configured relay, both commands),
+`--cafile FILE` (extra root CA, all commands).
 
 ## Resume
 
-With `--tunnel`, interrupted transfers resume automatically: re-run the same
-`send` command. If the receiver restarted (new code), re-run `send` with the
-new code — the partial data is matched by content fingerprint and only
-missing chunks are uploaded.
-
-The default WebRTC transport does not resume yet: an interrupted transfer
-re-sends from the start on retry. Resume for it is a planned follow-up.
+If the connection drops mid-transfer, the receiver keeps waiting and the code
+stays valid — re-run the same `send` command and only the missing chunks are
+sent (the receiver reports what it already staged, matched by content
+fingerprint). This works on both the relay and `--tunnel` paths.
 
 ## Diagnostics
 
-    b2p doctor            # is this network filtering DNS, inspecting TLS, blocking UDP?
+    b2p doctor            # DNS filtering, TLS inspection, UDP/STUN, relay reachability
     b2p doctor '<code>'   # same checks, aimed at a specific code's host
 
-Every check names the layer (DNS / TLS / UDP / HTTPS) and ends with a one-line
-verdict. `b2p send` runs it automatically when it cannot reach the receiver.
+Every check names the layer and ends with a one-line verdict; the relay check
+does a real WebSocket connect + ping round-trip. `b2p send` runs the doctor
+automatically when it cannot reach the receiver.
+
+## Advanced: direct P2P (`--p2p`) and the tunnel (`--tunnel`)
+
+Two alternative transports predate the relay and remain available:
+
+- `--p2p` on both sides uses the WebRTC stack: ntfy.sh rendezvous + STUN, with
+  optional UDP TURN for symmetric NAT (`--turn turn:host:3478` plus
+  `--turn-secret S` or `--turn-user U --turn-pass P`; `turn:` UDP only — the
+  WebRTC engine can't do TURN over TLS/TCP). Fast and free when it works, but
+  it is exactly the path that fails on CGNAT/UDP-blocked networks — that's why
+  the relay is the default. `--rendezvous <URL>` overrides the signaling host.
+- `receive --tunnel` uses the v1 Cloudflare-tunnel path (auto-detected by the
+  sender from the `https://…#…` code form). `--direct` (with `--tunnel`)
+  serves directly on the LAN. The first `--tunnel` run downloads a pinned,
+  checksum-verified `cloudflared` binary. On DNS-filtered networks the sender
+  re-resolves the tunnel host over DNS-over-HTTPS.
 
 ## Notes
 
 - b2p trusts the operating system's certificate store (plus `SSL_CERT_FILE` /
-  `SSL_CERT_DIR` / `--cafile`) for the rendezvous service; networks with TLS
-  inspection work as long as the proxy's root CA is installed. `b2p doctor`
-  verifies all layers (DNS, TLS, UDP, HTTPS).
-- If WebRTC is blocked, use `receive --tunnel` to fall back to the Cloudflare
-  path. The sender auto-detects the code type.
-- Behind **symmetric NAT** (no direct/STUN path forms), add a UDP TURN relay on
-  the affected peer: `--turn turn:turn.example.com:3478` plus either
-  `--turn-secret <coturn use-auth-secret>` (short-lived creds, recommended) or
-  `--turn-user U --turn-pass P` (static). Only `turn:` (UDP) URLs work — the
-  WebRTC engine can't do TURN over TLS/TCP, so a **UDP-blocked** network isn't
-  helped by TURN; a self-hostable HTTPS relay for that case is planned.
-- On the `--tunnel` path, if the network sinkholes the tunnel host at the DNS
-  layer (e.g. Cisco Umbrella blocking `*.trycloudflare.com`), the sender
-  re-resolves it over DNS-over-HTTPS (Cloudflare, then Google) so the connection
-  still forms, falling back to system DNS when DoH is unreachable. This is honest
-  resolution — asking a truthful resolver, not spoofing — and needs no flag. The
-  default WebRTC path never resolves a tunnel host, so it does not apply there.
-- The first `--tunnel` run downloads a pinned `cloudflared` binary (checksum-
-  verified — it refuses to run on mismatch) and reuses it on later runs.
+  `SSL_CERT_DIR` / `--cafile`); networks with TLS inspection work as long as
+  the proxy's root CA is installed.
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
-- `cargo test` runs the full offline test suite.
+- `cargo test` runs the full offline test suite (an in-process mock relay
+  stands in for the Worker). `B2P_TEST_RELAY_URL=wss://… cargo test --test
+  relay_live` runs a live smoke against your deployed Worker.
+- Some corporate filters category-block `*.workers.dev`; putting a custom
+  domain in front of the Worker sidesteps that (future recipe). Proxies that
+  require explicit HTTP CONNECT configuration are not supported yet.
 
 ## Development
 
