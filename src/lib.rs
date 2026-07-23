@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod cloudflared_pins;
 pub mod code;
+pub mod config;
 pub mod crypto;
 pub mod doctor;
 pub mod doh;

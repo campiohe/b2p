@@ -132,6 +132,25 @@ enum Cmd {
         /// A b2p code, URL, or hostname to test (default: the tunnel domain)
         target: Option<String>,
     },
+    /// Configure the relay this machine uses by default.
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Remember the relay URL (and optional token) in the config file.
+    Set {
+        /// wss://<your-worker>.workers.dev
+        url: String,
+        /// Bearer token, if the worker was deployed with RELAY_TOKEN
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Print the configured relay.
+    Show,
 }
 
 #[tokio::main]
@@ -170,6 +189,34 @@ async fn run() -> anyhow::Result<()> {
             rendezvous,
             turn,
         } => do_send(code, paths, text, rendezvous, turn, &tls).await,
+        Cmd::Relay { cmd } => match cmd {
+            RelayCmd::Set { url, token } => {
+                let url = b2p::transport::relay::normalize_relay_url(&url)?;
+                let mut cfg = b2p::config::load()?;
+                cfg.relay = Some(url.clone());
+                if token.is_some() {
+                    cfg.relay_token = token;
+                }
+                let p = b2p::config::save(&cfg)?;
+                eprintln!("relay set to {url} ({})", p.display());
+                Ok(())
+            }
+            RelayCmd::Show => {
+                let cfg = b2p::config::load()?;
+                match cfg.relay {
+                    Some(u) => println!(
+                        "{u}{}",
+                        if cfg.relay_token.is_some() {
+                            " (token set)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => println!("(none configured)"),
+                }
+                Ok(())
+            }
+        },
         Cmd::Doctor { target } => {
             let target_host = target.as_deref().map(parse_target).transpose()?;
             let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
@@ -540,12 +587,26 @@ mod tests {
         assert!(Cli::try_parse_from(["b2p", "receive", "--turn-user", "u"]).is_err());
         // --turn-secret conflicts with static creds
         assert!(Cli::try_parse_from([
-            "b2p", "receive", "--turn-secret", "s", "--turn-user", "u", "--turn-pass", "p"
+            "b2p",
+            "receive",
+            "--turn-secret",
+            "s",
+            "--turn-user",
+            "u",
+            "--turn-pass",
+            "p"
         ])
         .is_err());
         // valid: udp turn: + --turn-secret on send
         let cli = Cli::try_parse_from([
-            "b2p", "send", "7-a-b", "f", "--turn", "turn:h:3478", "--turn-secret", "s",
+            "b2p",
+            "send",
+            "7-a-b",
+            "f",
+            "--turn",
+            "turn:h:3478",
+            "--turn-secret",
+            "s",
         ])
         .unwrap();
         if let Cmd::Send { turn, .. } = cli.cmd {
@@ -554,9 +615,15 @@ mod tests {
             panic!("expected send");
         }
         // turns: (TLS) rejected at resolve() — webrtc-ice is UDP-only
-        let cli =
-            Cli::try_parse_from(["b2p", "receive", "--turn", "turns:h:5349", "--turn-secret", "s"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "b2p",
+            "receive",
+            "--turn",
+            "turns:h:5349",
+            "--turn-secret",
+            "s",
+        ])
+        .unwrap();
         if let Cmd::Receive { turn, .. } = cli.cmd {
             assert!(turn.resolve().is_err());
         } else {
