@@ -13,7 +13,7 @@
 use crate::archive::{unpack_tar, Source};
 use crate::crypto::{open, seal, Domain};
 use crate::pake::SessionKey;
-use crate::protocol::{Commit, CommitAck, Kind, Manifest, ManifestAck, PROTOCOL_VERSION};
+use crate::protocol::{Commit, CommitAck, Kind, Manifest, StreamManifestAck, PROTOCOL_VERSION};
 use crate::send::read_chunk;
 use crate::store::Store;
 use anyhow::{bail, Context};
@@ -77,6 +77,11 @@ fn blake3_file(path: &Path) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Length of chunk `i` in a transfer of `total_size` split at `chunk_size`.
+fn chunk_len(i: u64, total_size: u64, chunk_size: u64) -> u64 {
+    (total_size - i * chunk_size).min(chunk_size)
+}
+
 fn stream_manifest(source: &Source) -> Manifest {
     match source {
         Source::Blob {
@@ -126,7 +131,7 @@ pub async fn send_source(
     ch.send(&seal_val(&sk, Domain::StreamToReceiver, 0, &manifest))
         .await?;
     // 2. accept    (StreamToSender, index 0)
-    let ack: ManifestAck = open_val(&sk, Domain::StreamToSender, 0, &ch.recv().await?)
+    let ack: StreamManifestAck = open_val(&sk, Domain::StreamToSender, 0, &ch.recv().await?)
         .context("could not read the receiver's response (wrong code?)")?;
     if !ack.accepted {
         bail!("the receiver declined the transfer");
@@ -147,8 +152,16 @@ pub async fn send_source(
         pb.set_length(total_size);
     }
     for i in 0..total_chunks {
+        let n = chunk_len(i, total_size, STREAM_FRAME_SIZE);
+        // Chunk i is ALWAYS sealed at nonce index 1+i, so skipping staged
+        // chunks creates no nonce ambiguity on either side.
+        if ack.complete || crate::protocol::runs_contain(&ack.have_runs, i) {
+            if let Some(pb) = &progress {
+                pb.inc(n);
+            }
+            continue;
+        }
         let plain = read_chunk(&path, i, STREAM_FRAME_SIZE, total_size)?;
-        let n = plain.len() as u64;
         ch.send(&seal(&sk, Domain::StreamToReceiver, 1 + i, b"", &plain))
             .await?;
         if let Some(pb) = &progress {
@@ -194,10 +207,10 @@ pub async fn recv_into(
             &sk,
             Domain::StreamToSender,
             0,
-            &ManifestAck {
+            &StreamManifestAck {
                 accepted: false,
                 complete: false,
-                have: vec![],
+                have_runs: vec![],
             },
         ))
         .await?;
@@ -210,10 +223,10 @@ pub async fn recv_into(
             &sk,
             Domain::StreamToSender,
             0,
-            &ManifestAck {
+            &StreamManifestAck {
                 accepted: false,
                 complete: false,
-                have: vec![],
+                have_runs: vec![],
             },
         ))
         .await?;
@@ -226,26 +239,38 @@ pub async fn recv_into(
     // 2. accept decision — delegated to the caller  (StreamToSender, index 0)
     let name = safe_name(&manifest.name);
     let accepted = accept(&manifest);
-    ch.send(&seal_val(
-        &sk,
-        Domain::StreamToSender,
-        0,
-        &ManifestAck {
-            accepted,
-            complete: false,
-            have: vec![],
-        },
-    ))
-    .await?;
     if !accepted {
+        ch.send(&seal_val(
+            &sk,
+            Domain::StreamToSender,
+            0,
+            &StreamManifestAck {
+                accepted: false,
+                complete: false,
+                have_runs: vec![],
+            },
+        ))
+        .await?;
         bail!("transfer declined");
     }
-
     if manifest.kind == Kind::Text {
+        ch.send(&seal_val(
+            &sk,
+            Domain::StreamToSender,
+            0,
+            &StreamManifestAck {
+                accepted: true,
+                complete: false,
+                have_runs: vec![],
+            },
+        ))
+        .await?;
         return Ok(manifest.text.unwrap_or_default());
     }
 
-    // 3. stage payload frames into the Store
+    // 3. open the store BEFORE acking, so the ack can carry what a previous
+    // interrupted run already staged (same content fingerprint → same
+    // transfer_id → the Store resumes; anything else → fresh state).
     let mut store = Store::open_or_create(
         out_dir,
         &name,
@@ -253,11 +278,31 @@ pub async fn recv_into(
         manifest.total_size,
         manifest.chunk_size,
     )?;
+    let have = store.have();
+    ch.send(&seal_val(
+        &sk,
+        Domain::StreamToSender,
+        0,
+        &StreamManifestAck {
+            accepted: true,
+            complete: store.is_complete(),
+            have_runs: crate::protocol::runs_from_sorted(&have),
+        },
+    ))
+    .await?;
+
     if let Some(pb) = &progress {
         pb.set_length(manifest.total_size);
+        for &i in &have {
+            pb.inc(chunk_len(i, manifest.total_size, manifest.chunk_size));
+        }
     }
+    let have_set: std::collections::HashSet<u64> = have.into_iter().collect();
     let total_chunks = manifest.total_chunks();
     for i in 0..total_chunks {
+        if have_set.contains(&i) {
+            continue;
+        }
         let ct = ch.recv().await?;
         let plain = open(&sk, Domain::StreamToReceiver, 1 + i, b"", &ct)
             .map_err(|_| anyhow::anyhow!("frame {i} failed to decrypt"))?;
@@ -521,6 +566,105 @@ mod tests {
             sent.is_err(),
             "sender should see the receiver's hash-mismatch failure"
         );
+    }
+
+    struct CountingPipe {
+        inner: Pipe,
+        sends: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    #[async_trait]
+    impl MsgChannel for CountingPipe {
+        async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.send(msg).await
+        }
+        async fn recv(&mut self) -> anyhow::Result<Vec<u8>> {
+            self.inner.recv().await
+        }
+    }
+
+    /// Stage the given chunks exactly as a previous interrupted run would
+    /// have left them.
+    fn pre_stage(out_dir: &Path, name: &str, src_file: &Path, transfer_id: &str, chunks: &[u64]) {
+        let total_size = std::fs::metadata(src_file).unwrap().len();
+        let mut store = crate::store::Store::open_or_create(
+            out_dir,
+            name,
+            transfer_id,
+            total_size,
+            STREAM_FRAME_SIZE,
+        )
+        .unwrap();
+        for &i in chunks {
+            let plain = read_chunk(src_file, i, STREAM_FRAME_SIZE, total_size).unwrap();
+            store.write_chunk(i, &plain).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_sends_only_missing_chunks() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..(STREAM_FRAME_SIZE as usize * 4 + 5))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(src.path().join("big.bin"), &content).unwrap();
+        let source = archive::prepare(&[src.path().join("big.bin")]).unwrap();
+        pre_stage(
+            out.path(),
+            "big.bin",
+            &src.path().join("big.bin"),
+            source.transfer_id(),
+            &[0, 2],
+        );
+        let (s, r) = pipe();
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut s = CountingPipe {
+            inner: s,
+            sends: sends.clone(),
+        };
+        let mut r = r;
+        let k = key();
+        let out_path = out.path().to_path_buf();
+        let recv =
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
+        send_source(&mut s, &k, &source, None).await.unwrap();
+        recv.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(out.path().join("big.bin")).unwrap(), content);
+        // manifest + 3 missing payload frames (1, 3, 4) + commit = 5 sends
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn resume_complete_store_skips_all_payload() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let content = vec![42u8; STREAM_FRAME_SIZE as usize * 2];
+        std::fs::write(src.path().join("f.bin"), &content).unwrap();
+        let source = archive::prepare(&[src.path().join("f.bin")]).unwrap();
+        pre_stage(
+            out.path(),
+            "f.bin",
+            &src.path().join("f.bin"),
+            source.transfer_id(),
+            &[0, 1],
+        );
+        let (s, r) = pipe();
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut s = CountingPipe {
+            inner: s,
+            sends: sends.clone(),
+        };
+        let mut r = r;
+        let k = key();
+        let out_path = out.path().to_path_buf();
+        let recv =
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
+        send_source(&mut s, &k, &source, None).await.unwrap();
+        recv.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(out.path().join("f.bin")).unwrap(), content);
+        // manifest + commit only
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

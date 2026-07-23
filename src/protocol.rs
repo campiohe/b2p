@@ -42,6 +42,34 @@ pub struct ManifestAck {
     pub have: Vec<u64>,
 }
 
+/// The v2 stream path's reply to a manifest (stream.rs). Separate from the
+/// tunnel path's `ManifestAck` so the v1 HTTP wire format stays frozen.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StreamManifestAck {
+    pub accepted: bool,
+    pub complete: bool,
+    /// Runs (start, len) of chunk indices the receiver already has staged —
+    /// run-length form so a mostly-complete 2 GiB transfer doesn't produce a
+    /// megabyte of JSON indices.
+    pub have_runs: Vec<(u64, u64)>,
+}
+
+/// Compress a sorted index list into (start, len) runs.
+pub fn runs_from_sorted(sorted: &[u64]) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &i in sorted {
+        match runs.last_mut() {
+            Some((start, len)) if *start + *len == i => *len += 1,
+            _ => runs.push((i, 1)),
+        }
+    }
+    runs
+}
+
+pub fn runs_contain(runs: &[(u64, u64)], i: u64) -> bool {
+    runs.iter().any(|&(s, l)| i >= s && i < s + l)
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatusResp {
     pub have: Vec<u64>,
@@ -91,6 +119,19 @@ mod tests {
             total_size: 9_000_000,
             chunk_size: 4 * 1024 * 1024,
             text: None,
+        }
+    }
+
+    #[test]
+    fn runs_compress_and_query() {
+        assert_eq!(runs_from_sorted(&[]), vec![]);
+        assert_eq!(
+            runs_from_sorted(&[0, 1, 2, 5, 7, 8]),
+            vec![(0, 3), (5, 1), (7, 2)]
+        );
+        let runs = runs_from_sorted(&[0, 1, 2, 5]);
+        for (i, want) in [(0, true), (2, true), (3, false), (5, true), (6, false)] {
+            assert_eq!(runs_contain(&runs, i), want, "index {i}");
         }
     }
 
