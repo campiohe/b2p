@@ -36,6 +36,19 @@ and `docs/superpowers/specs/2026-07-23-b2p-v2-p2a-turn-design.md`. Plan:
 > 6. Config uses the already-present `directories` crate (not `dirs`);
 >    doctor's symmetric-NAT verdict now points at the relay default rather
 >    than `--turn`, and notes when the configured relay is reachable.
+> 7. Post-review hardening (two-reviewer whole-branch pass): the configured
+>    bearer token is never sent to a relay host taken from someone else's
+>    `b2p://` code; room expiry / relay restarts while waiting re-dial
+>    quietly instead of aborting the receiver (typed `WaitClosed`); the
+>    Worker performs duplicate-role takeover (a reconnecting peer is never
+>    locked out behind its own stale socket; suppressed spurious peer-left);
+>    409 retries back off exponentially (~2 min) and the counter resets per
+>    stretch; post-pairing handshake failures (silent/hostile senders) are
+>    re-armable; a window-blocked sender errors after 5 min of zero ack
+>    progress instead of hanging on a wedged receiver; the io task drains its
+>    queue before flushing so batching actually engages; metadata frames over
+>    64 MiB fail fast with an "archive first" hint instead of an endless
+>    retry loop; §8's room-id entropy claim corrected (see §8).
 
 ---
 
@@ -216,9 +229,17 @@ carries ciphertext only and cannot learn the code, keys, or filenames. Room
 ids are derived one-way from the code secret. A wrong-code sender fails PAKE
 confirmation exactly as on the ntfy path. New trust surface: the operator's
 own Cloudflare account replaces ntfy.sh as the (blind) traffic carrier — a
-strict improvement. Abuse of an open relay by strangers is limited by
-high-entropy room ids (unguessable; both parties must know the code) and,
-where wanted, the deploy-time bearer token.
+strict improvement.
+
+**Abuse honesty (corrected in review):** room ids are high-entropy ONLY for
+`b2p://` (URL) codes. Human codes derive the room from the channel byte
+alone — the same must-not-leak-the-PAKE-password constraint as the ntfy
+topic — so the default transport has just 256 enumerable human rooms. Data
+stays safe regardless (PAKE + AEAD), but a stranger who learns the relay URL
+can squat rooms / disrupt availability on a tokenless relay. The deploy-time
+bearer token is therefore the real abuse defense and is recommended for any
+relay whose URL circulates; the receiver additionally backs off on
+wrong-code senders and keeps re-arming rather than dying.
 
 Known residual gaps, accepted for P2b: networks that category-block
 `*.workers.dev` (fix later with a custom domain), and corporate proxies that

@@ -500,6 +500,15 @@ async fn receive_relay_cli(
                 eprintln!("Done: {desc}");
                 return Ok(());
             }
+            // Room expiry / relay restart while waiting: quiet re-dial (the
+            // dial itself surfaces a genuinely dead network as an
+            // EstablishError below).
+            Err(e)
+                if e.downcast_ref::<b2p::transport::relay::WaitClosed>()
+                    .is_some() =>
+            {
+                busy_retries = 0;
+            }
             Err(e)
                 if e.downcast_ref::<b2p::transport::relay::TransportLost>()
                     .is_some() =>
@@ -507,21 +516,29 @@ async fn receive_relay_cli(
                 eprintln!(
                     "connection lost ({e:#}) — the code is still valid; waiting for the sender to retry..."
                 );
+                busy_retries = 0;
             }
             Err(e) if e.downcast_ref::<b2p::handshake::CodeMismatch>().is_some() => {
                 eprintln!("a sender connected with a non-matching code — still waiting...");
                 busy_retries = 0;
+                // Backoff so a wrong-code (or hostile) sender can't make the
+                // receiver hot-cycle full connect+PAKE rounds.
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
+            // Transient 409: the edge can hold a dead predecessor socket for
+            // minutes — back off exponentially (~2 min total budget). The
+            // counter is per-stretch: any other outcome resets it.
             Err(e)
-                if busy_retries < 5
+                if busy_retries < 8
                     && e.downcast_ref::<b2p::session::EstablishError>()
                         .is_some_and(|ee| {
                             ee.0.downcast_ref::<b2p::transport::relay::RoomBusy>()
                                 .is_some()
                         }) =>
             {
+                let delay = (2u64 << busy_retries).min(20);
                 busy_retries += 1;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(delay)).await;
             }
             Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
                 return connect_failed_relay(e, &relay, tls).await;

@@ -1,6 +1,7 @@
 // Usage: node test.mjs ws://127.0.0.1:8787   (or wss://<worker>.workers.dev)
 // Exercises: healthz, pairing, binary forwarding (600 KiB), text/ack
-// forwarding, ping auto-response, peer-left, 409 on duplicate role.
+// forwarding, ping auto-response, duplicate-role takeover (no spurious
+// peer-left), peer-left on real departure.
 const base = process.argv[2];
 if (!base) throw new Error("usage: node test.mjs <ws-base-url>");
 const httpBase = base.replace(/^ws/, "http");
@@ -39,10 +40,6 @@ const send = await open("send");
 assert((await next(recv, "peer-joined@recv")) === '{"t":"peer-joined"}', "peer-joined at recv");
 assert((await next(send, "peer-joined@send")) === '{"t":"peer-joined"}', "peer-joined at send");
 
-const dup = new WebSocket(url("send"));
-await new Promise((res) => { dup.onerror = res; dup.onclose = res; });
-assert(dup.readyState !== WebSocket.OPEN, "duplicate role refused");
-
 const payload = new Uint8Array(600 * 1024).map((_, i) => i % 251);
 send.send(payload);
 const got = new Uint8Array(await next(recv, "binary forward", 15000));
@@ -54,7 +51,17 @@ assert((await next(send, "ack forward")) === '{"t":"ack","n":614400}', "ack forw
 send.send('{"t":"ping"}');
 assert((await next(send, "pong")) === '{"t":"pong"}', "ping auto-response");
 
-send.close();
+// Takeover: a second join in the same role replaces the first — the old
+// socket is closed, the peer keeps its pairing (no spurious peer-left) and
+// hears a fresh peer-joined.
+const oldClosed = new Promise((res) => { send.onclose = res; });
+const send2 = await open("send");
+await oldClosed;
+assert(true, "old sender closed on takeover");
+assert((await next(send2, "peer-joined@send2")) === '{"t":"peer-joined"}', "peer-joined at send2");
+assert((await next(recv, "peer-joined again")) === '{"t":"peer-joined"}', "recv re-paired, no spurious peer-left");
+
+send2.close();
 assert((await next(recv, "peer-left")) === '{"t":"peer-left"}', "peer-left at recv");
 recv.close();
 console.log("ALL OK");

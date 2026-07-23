@@ -44,7 +44,12 @@ pub fn save(cfg: &Config) -> anyhow::Result<PathBuf> {
 }
 
 /// URL precedence: `--relay` flag > host embedded in the code > `B2P_RELAY`
-/// env > config file > a clear error. Token precedence: env > file.
+/// env > config file > a clear error. Token precedence: env > file — but the
+/// token is attached ONLY when the winning URL is one the user configured
+/// themselves (flag/env/file), or a code-embedded host that MATCHES their
+/// configured relay. A `b2p://` code names an arbitrary host chosen by
+/// whoever produced the code; sending the user's bearer token there would
+/// hand it to a stranger's server.
 pub fn resolve_relay(
     flag: Option<&str>,
     code_host: Option<&str>,
@@ -52,28 +57,44 @@ pub fn resolve_relay(
     env_token: Option<&str>,
     file: &Config,
 ) -> anyhow::Result<RelayCfg> {
-    let url = if let Some(f) = flag {
-        normalize_relay_url(f)?
+    // The user's own relay, if any (flag > env > file) — both a resolution
+    // fallback and the only destination the token may travel to.
+    let own: Option<String> = if let Some(f) = flag {
+        Some(normalize_relay_url(f)?)
+    } else if let Some(e) = env_url {
+        Some(normalize_relay_url(e)?)
+    } else if let Some(f) = &file.relay {
+        Some(normalize_relay_url(f)?)
+    } else {
+        None
+    };
+
+    let (url, trusted) = if let Some(f) = flag {
+        (normalize_relay_url(f)?, true)
     } else if let Some(h) = code_host {
         let h = if h.contains("://") {
             h.to_string()
         } else {
             format!("wss://{h}")
         };
-        normalize_relay_url(&h)?
-    } else if let Some(e) = env_url {
-        normalize_relay_url(e)?
-    } else if let Some(f) = &file.relay {
-        normalize_relay_url(f)?
+        let url = normalize_relay_url(&h)?;
+        let matches_own = own.as_deref() == Some(url.as_str());
+        (url, matches_own)
+    } else if let Some(own) = own.clone() {
+        (own, true)
     } else {
         anyhow::bail!(
             "no relay configured — deploy relay-worker/ once (npx wrangler deploy), then run: \
              b2p relay set wss://<your-worker>.workers.dev  (or pass --relay / set B2P_RELAY)"
         );
     };
-    let token = env_token
-        .map(str::to_string)
-        .or_else(|| file.relay_token.clone());
+    let token = if trusted {
+        env_token
+            .map(str::to_string)
+            .or_else(|| file.relay_token.clone())
+    } else {
+        None
+    };
     Ok(RelayCfg { url, token })
 }
 
@@ -110,6 +131,27 @@ mod tests {
         let r = resolve_relay(None, None, None, None, &file).unwrap();
         assert_eq!(r.url, "wss://file.example");
         assert_eq!(r.token.as_deref(), Some("ft"));
+    }
+
+    #[test]
+    fn token_never_travels_to_a_foreign_code_host() {
+        // A b2p:// code names a host chosen by whoever made the code — the
+        // user's configured bearer token must not be sent there.
+        let file = Config {
+            relay: Some("wss://my.relay".into()),
+            relay_token: Some("secret".into()),
+        };
+        let foreign = resolve_relay(None, Some("attacker.example"), None, None, &file).unwrap();
+        assert_eq!(foreign.url, "wss://attacker.example");
+        assert_eq!(foreign.token, None, "token leaked to a code-chosen host");
+        // ...but a code naming the user's OWN relay keeps the token.
+        let own = resolve_relay(None, Some("my.relay"), None, None, &file).unwrap();
+        assert_eq!(own.url, "wss://my.relay");
+        assert_eq!(own.token.as_deref(), Some("secret"));
+        // env token with no configured URL: still never to a code host.
+        let bare = Config::default();
+        let r = resolve_relay(None, Some("x.example"), None, Some("et"), &bare).unwrap();
+        assert_eq!(r.token, None);
     }
 
     #[test]

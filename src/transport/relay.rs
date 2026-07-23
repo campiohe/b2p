@@ -32,6 +32,9 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_EVERY: u64 = 1024 * 1024;
 const WINDOW: u64 = 8 * 1024 * 1024;
 const PING_EVERY: Duration = Duration::from_secs(30);
+/// How long a window-blocked send tolerates zero ack movement before
+/// declaring the peer stalled.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PING: &str = r#"{"t":"ping"}"#;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -202,6 +205,20 @@ async fn dial(
     Ok(ws)
 }
 
+/// The relay ended the connection while we were waiting for a peer (room
+/// expiry alarm, DO restart, network blip). Re-dialing re-arms the room, so
+/// a waiting receiver treats this as "reconnect", not "give up" — the
+/// re-dial itself discriminates a dead network (it fails fast as a genuine
+/// establishment error).
+#[derive(Debug)]
+pub struct WaitClosed(pub String);
+impl std::fmt::Display for WaitClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the relay connection ended while waiting: {}", self.0)
+    }
+}
+impl std::error::Error for WaitClosed {}
+
 /// The relay answered 409: the room already has a socket in our role. Usually
 /// a just-closed predecessor the DO hasn't reaped yet (receiver re-arm) or a
 /// genuine code collision — callers may retry briefly before giving up.
@@ -246,24 +263,28 @@ pub async fn connect(
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
+    let wait_closed = |reason: &str| anyhow::Error::new(WaitClosed(reason.to_string()));
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
                 anyhow::bail!("timed out waiting for the other side — is it running with the same code?");
             }
             _ = ping.tick() => {
-                ws.send(Message::Text(PING.into())).await
-                    .context("relay connection dropped while waiting")?;
+                if ws.send(Message::Text(PING.into())).await.is_err() {
+                    return Err(wait_closed("keepalive failed"));
+                }
             }
             item = ws.next() => {
-                let msg = item
-                    .ok_or_else(|| anyhow!("the relay closed the connection while waiting"))?
-                    .context("relay connection failed while waiting")?;
+                let msg = match item {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(wait_closed(&format!("socket error: {e}"))),
+                    None => return Err(wait_closed("connection closed")),
+                };
                 match msg {
                     Message::Text(t) => {
                         if parse_control(&t) == Some(Control::PeerJoined) { break; }
                     }
-                    Message::Close(_) => anyhow::bail!("the relay closed the connection while waiting (room expired?)"),
+                    Message::Close(_) => return Err(wait_closed("room expired or relay restarted")),
                     _ => {}
                 }
             }
@@ -310,7 +331,10 @@ impl RelayChannel {
         lost(reason)
     }
 
-    /// Flush queued frames and close the socket; bounded.
+    /// Flush queued frames and close the socket; bounded at 5 s. On a dead
+    /// TCP path the io task (and its socket) may outlive this call until the
+    /// kernel gives up — harmless for the CLI (the process exits soon after)
+    /// but worth knowing for library callers.
     pub async fn close(mut self) {
         let _ = self.out_tx.send(OutMsg::Close);
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -327,6 +351,17 @@ impl RelayChannel {
 #[async_trait]
 impl MsgChannel for RelayChannel {
     async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
+        // Fail fast (a plain error, deliberately NOT TransportLost: retrying
+        // hits the identical wall) rather than let the receiver's Debatcher
+        // kill the connection and trigger an endless re-arm/retry loop.
+        if msg.len() > MAX_LOGICAL_FRAME {
+            anyhow::bail!(
+                "a metadata frame of {} bytes exceeds the relay limit ({MAX_LOGICAL_FRAME}) — \
+                 for folders with very many files, archive first (e.g. tar.gz) and send the \
+                 single file",
+                msg.len()
+            );
+        }
         // Window check. watch::changed() is version-counted, so an ack that
         // lands between borrow() and changed() still wakes us — no lost-
         // wakeup race (the P2a close-latch lesson). A frame larger than the
@@ -336,15 +371,27 @@ impl MsgChannel for RelayChannel {
         // consumed bytes are never acknowledged — `unacked < ACK_EVERY` is
         // the true "drained" floor. Without this escape an oversized frame
         // would stall forever; with it, relay buffering stays bounded by
-        // max(WINDOW, frame size) + ACK_EVERY.
+        // max(WINDOW, frame size) + ACK_EVERY. The progress watchdog turns a
+        // receiver whose app wedged (alive socket, zero ack movement — its
+        // pings are auto-answered by the relay, so the socket never dies)
+        // into an error instead of an eternal park.
         loop {
             let acked = *self.acked_rx.borrow();
             let unacked = self.sent.saturating_sub(acked);
             if unacked + msg.len() as u64 <= WINDOW || unacked < ACK_EVERY {
                 break;
             }
-            if self.acked_rx.changed().await.is_err() {
-                return Err(self.death_reason("connection lost while sending"));
+            match tokio::time::timeout(PROGRESS_TIMEOUT, self.acked_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(self.death_reason("connection lost while sending"));
+                }
+                Err(_) => {
+                    return Err(lost(format!(
+                        "no acknowledgment progress for {}s — the receiver appears stalled",
+                        PROGRESS_TIMEOUT.as_secs()
+                    )));
+                }
             }
         }
         self.sent += msg.len() as u64;
@@ -394,7 +441,19 @@ async fn io_task(
         }
         tokio::select! {
             out = out_rx.recv() => match out {
-                Some(OutMsg::Frame(f)) => pending.push_back(f),
+                Some(OutMsg::Frame(f)) => {
+                    pending.push_back(f);
+                    // Drain whatever the app already queued so pack_frames
+                    // can actually batch — without this, one select-recv per
+                    // flush means one WS message per app frame.
+                    loop {
+                        match out_rx.try_recv() {
+                            Ok(OutMsg::Frame(f)) => pending.push_back(f),
+                            Ok(OutMsg::Close) => { closing = true; break; }
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Some(OutMsg::Close) | None => closing = true,
             },
             _ = ping.tick() => {
@@ -709,5 +768,98 @@ mod tests {
     async fn probe_round_trips_ping() {
         let relay = crate::transport::mock::start().await;
         probe(&relay.url, None, &TlsOpts::default()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_role_is_a_room_busy_error() {
+        let relay = crate::transport::mock::start().await;
+        let tls = TlsOpts::default();
+        // First receiver parks in the room, waiting for a sender.
+        let first = tokio::spawn({
+            let url = relay.url.clone();
+            async move {
+                connect(
+                    &url,
+                    "roomDup",
+                    Role::Receiver,
+                    None,
+                    &TlsOpts::default(),
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second = connect(
+            &relay.url,
+            "roomDup",
+            Role::Receiver,
+            None,
+            &tls,
+            Duration::from_secs(5),
+        )
+        .await;
+        let e = second.err().expect("duplicate role must be refused");
+        assert!(e.downcast_ref::<RoomBusy>().is_some(), "got: {e:#}");
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn server_close_while_waiting_is_wait_closed() {
+        // A raw server that accepts the WS then closes it — the client's
+        // wait loop must classify that as re-armable WaitClosed, not a
+        // generic establishment failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = ws.close(None).await;
+        });
+        let r = connect(
+            &url,
+            "roomX",
+            Role::Receiver,
+            None,
+            &TlsOpts::default(),
+            Duration::from_secs(10),
+        )
+        .await;
+        let e = r.err().expect("close during wait must error");
+        assert!(e.downcast_ref::<WaitClosed>().is_some(), "got: {e:#}");
+    }
+
+    #[tokio::test]
+    async fn oversized_metadata_frame_fails_fast_not_transport_lost() {
+        let relay = crate::transport::mock::start().await;
+        let tls = TlsOpts::default();
+        let (r, s) = tokio::join!(
+            connect(
+                &relay.url,
+                "roomHuge",
+                Role::Receiver,
+                None,
+                &tls,
+                Duration::from_secs(10)
+            ),
+            connect(
+                &relay.url,
+                "roomHuge",
+                Role::Sender,
+                None,
+                &tls,
+                Duration::from_secs(10)
+            )
+        );
+        let (r, mut s) = (r.unwrap(), s.unwrap());
+        let huge = vec![0u8; MAX_LOGICAL_FRAME + 1];
+        let e = s.send(&huge).await.expect_err("must refuse");
+        assert!(
+            e.downcast_ref::<TransportLost>().is_none(),
+            "must not be retried as a transient loss"
+        );
+        assert!(e.to_string().contains("archive first"), "got: {e:#}");
+        drop(r);
     }
 }

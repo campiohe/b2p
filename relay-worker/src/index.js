@@ -34,8 +34,12 @@ export class Room {
     const role = new URL(request.url).searchParams.get("role");
     if (role !== "send" && role !== "recv")
       return new Response("bad role", { status: 400 });
-    if (this.ctx.getWebSockets(role).length > 0)
-      return new Response("room full", { status: 409 });
+    // Takeover: a new join replaces any existing socket in the same role.
+    // The Cloudflare edge can hold a silently-dead socket for minutes; a
+    // reconnecting peer must not be locked out behind its own stale self.
+    for (const old of this.ctx.getWebSockets(role)) {
+      old.close(1012, "replaced by a new connection");
+    }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -63,13 +67,25 @@ export class Room {
   }
 
   async webSocketClose(ws) {
-    const peer = this.peerOf(this.ctx.getTags(ws)[0]);
-    if (peer) peer.send(JSON.stringify({ t: "peer-left" }));
+    await this.departed(ws);
   }
 
   async webSocketError(ws) {
-    const peer = this.peerOf(this.ctx.getTags(ws)[0]);
-    if (peer) peer.send(JSON.stringify({ t: "peer-left" }));
+    await this.departed(ws);
+  }
+
+  async departed(ws) {
+    const role = this.ctx.getTags(ws)[0];
+    // A replaced socket (takeover) must not send peer-left: its replacement
+    // is already paired with the peer.
+    if (this.ctx.getWebSockets(role).some((s) => s !== ws)) return;
+    const peer = this.peerOf(role);
+    if (peer) {
+      peer.send(JSON.stringify({ t: "peer-left" }));
+      // The survivor is alone again — re-arm the expiry so an abandoned
+      // socket can't squat the room forever.
+      await this.ctx.storage.setAlarm(Date.now() + EXPIRE_UNPAIRED_MS);
+    }
   }
 
   async alarm() {

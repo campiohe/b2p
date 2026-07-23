@@ -32,9 +32,15 @@ Cloudflare account and Node.js:
     npx wrangler login          # opens the browser once
     npx wrangler deploy         # prints https://b2p-relay.<account>.workers.dev
 
-Optionally restrict it to holders of a shared token:
+Optionally restrict it to holders of a shared token (recommended once your
+relay URL circulates — short human codes use a small, enumerable room
+namespace, so the token is what keeps strangers from squatting rooms on your
+relay; your data is end-to-end encrypted either way):
 
     npx wrangler secret put RELAY_TOKEN
+
+The token stays private to your own relay: b2p never sends it to a relay
+address that came from someone else's `b2p://` code.
 
 Then, on each machine that will use b2p:
 

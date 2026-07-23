@@ -10,7 +10,7 @@ use crate::pake::Role;
 use crate::protocol::Manifest;
 use crate::rendezvous::Rendezvous;
 use crate::stream::{recv_into, send_source, MsgChannel};
-use crate::transport::relay::{self, TransportLost};
+use crate::transport::relay::{self, TransportLost, WaitClosed};
 use crate::transport::webrtc::connect;
 use std::path::Path;
 use std::sync::Arc;
@@ -117,12 +117,31 @@ pub async fn receive_relay(
     wait_peer: Duration,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
+    // WaitClosed (room expiry / relay restart mid-wait) passes through: the
+    // caller re-dials, and a genuinely dead network fails THAT dial fast as
+    // a real EstablishError.
     let mut ch = relay::connect(relay_url, topic, Role::Receiver, token, tls, wait_peer)
         .await
-        .map_err(EstablishError)?;
-    let key = handshake_over_channel(&mut ch, topic, secret, Role::Receiver)
-        .await
-        .map_err(establish_unless_rearmed)?;
+        .map_err(|e| {
+            if e.downcast_ref::<WaitClosed>().is_some() {
+                e
+            } else {
+                EstablishError(e).into()
+            }
+        })?;
+    // Post-pairing handshake failures are the PEER's doing (mismatch, silent
+    // stall, disconnect), never the network's — all re-armable, so a hostile
+    // or broken sender can't kill a waiting receiver.
+    let key = match handshake_over_channel(&mut ch, topic, secret, Role::Receiver).await {
+        Ok(k) => k,
+        Err(e)
+            if e.downcast_ref::<CodeMismatch>().is_some()
+                || e.downcast_ref::<TransportLost>().is_some() =>
+        {
+            return Err(e)
+        }
+        Err(e) => return Err(anyhow::Error::new(TransportLost(e))),
+    };
     let desc = recv_into(&mut ch, &key, out_dir, accept, progress).await?;
     // Same graceful-close rationale as receive_p1: wait (bounded) for the
     // sender to see our CommitAck before tearing the socket down.

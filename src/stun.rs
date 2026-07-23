@@ -234,7 +234,10 @@ mod tests {
         let diff_ip: SocketAddr = "198.51.100.7:40000".parse().unwrap();
         assert_eq!(classify_mapping(&[]), NatMapping::NoResponse);
         assert_eq!(classify_mapping(&[a]), NatMapping::OneResponse(a));
-        assert_eq!(classify_mapping(&[a, a]), NatMapping::EndpointIndependent(a));
+        assert_eq!(
+            classify_mapping(&[a, a]),
+            NatMapping::EndpointIndependent(a)
+        );
         assert_eq!(
             classify_mapping(&[a, diff_port]),
             NatMapping::Symmetric(vec![a, diff_port])

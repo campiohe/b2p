@@ -161,7 +161,8 @@ async fn build_pc(
         .with_interceptor_registry(registry)
         .build();
     Ok(Arc::new(
-        api.new_peer_connection(build_pc_config(ice_servers)).await?,
+        api.new_peer_connection(build_pc_config(ice_servers))
+            .await?,
     ))
 }
 
@@ -655,15 +656,29 @@ mod tests {
 
         let (rv_r, key_r) = (rv.clone(), key.clone());
         let recv_task = tokio::spawn(async move {
-            connect(rv_r, topic, &key_r, Role::Receiver, &[], Duration::from_secs(20))
-                .await
-                .unwrap()
+            connect(
+                rv_r,
+                topic,
+                &key_r,
+                Role::Receiver,
+                &[],
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap()
         });
         let (rv_s, key_s) = (rv.clone(), key.clone());
         let send_task = tokio::spawn(async move {
-            connect(rv_s, topic, &key_s, Role::Sender, &[], Duration::from_secs(20))
-                .await
-                .unwrap()
+            connect(
+                rv_s,
+                topic,
+                &key_s,
+                Role::Sender,
+                &[],
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap()
         });
         let recv_ch = recv_task.await.unwrap();
         let mut send_ch = send_task.await.unwrap();
@@ -759,6 +774,10 @@ mod tests {
         .await
         .unwrap_or(false);
         let _ = pc.close().await;
-        assert!(got_relay, "expected a relay candidate from {}", servers[0].urls[0]);
+        assert!(
+            got_relay,
+            "expected a relay candidate from {}",
+            servers[0].urls[0]
+        );
     }
 }

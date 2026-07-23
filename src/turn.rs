@@ -47,8 +47,7 @@ pub fn ephemeral_credential(secret: &str, nonce: &str, expiry_unix: u64) -> (Str
     let mut mac =
         HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts a key of any length");
     mac.update(username.as_bytes());
-    let credential =
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
     (username, credential)
 }
 

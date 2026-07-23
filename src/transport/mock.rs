@@ -1,6 +1,11 @@
 //! In-process relay speaking protocol v1 for offline tests. Mirrors
 //! relay-worker/src/index.js; the live smoke (tests/relay_live.rs) guards
 //! against drift from the real Worker.
+//!
+//! One DELIBERATE divergence: a duplicate-role join gets HTTP 409 here,
+//! while the real Worker performs a takeover (closes the old socket). The
+//! mock models the stale-socket case so the client's RoomBusy retry path
+//! has offline coverage; the Worker side is covered by relay-worker/test.mjs.
 
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -43,12 +48,26 @@ pub async fn start() -> MockRelay {
             let peers = peers.clone();
             tokio::spawn(async move {
                 let mut path = String::new();
+                let cb_peers = peers.clone();
                 // The Err type (an http::Response) is tungstenite's Callback
                 // contract, not ours.
                 #[allow(clippy::result_large_err)]
                 let ws =
                     tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
                         path = req.uri().to_string();
+                        // 409 on duplicate role — see module docs.
+                        if let Some((room, role)) = path
+                            .strip_prefix("/v1/room/")
+                            .and_then(|r| r.split_once("?role="))
+                        {
+                            let key = format!("{room}/{role}");
+                            if cb_peers.lock().expect("lock").contains_key(&key) {
+                                let mut err = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(None);
+                                *err.status_mut() =
+                                    tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT;
+                                return Err(err);
+                            }
+                        }
                         Ok(resp)
                     })
                     .await;
