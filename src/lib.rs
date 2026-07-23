@@ -13,6 +13,7 @@ pub mod rvcode;
 pub mod send;
 pub mod server;
 pub mod store;
+pub mod stream;
 pub mod stun;
 pub mod tlsprobe;
 pub mod tunnel;
