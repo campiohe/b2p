@@ -428,7 +428,7 @@ mod tests {
             )
             .await
             .unwrap();
-            stream::recv_into(&mut ch, &key_r, &out_path, true, false, None).await
+            stream::recv_into(&mut ch, &key_r, &out_path, |_| true, None).await
         });
 
         // sender: connect as Sender, then send_source

@@ -12,6 +12,7 @@ pub mod rendezvous;
 pub mod rvcode;
 pub mod send;
 pub mod server;
+pub mod session;
 pub mod store;
 pub mod stream;
 pub mod stun;

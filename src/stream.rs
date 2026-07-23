@@ -181,8 +181,7 @@ pub async fn recv_into(
     ch: &mut dyn MsgChannel,
     key: &SessionKey,
     out_dir: &Path,
-    auto_accept: bool,
-    overwrite: bool,
+    accept: impl FnOnce(&Manifest) -> bool,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
     let sk = key.stream_key();
@@ -224,10 +223,9 @@ pub async fn recv_into(
         );
     }
 
-    // 2. accept decision (auto for now; P1e adds the interactive prompt)  (StreamToSender, index 0)
+    // 2. accept decision — delegated to the caller  (StreamToSender, index 0)
     let name = safe_name(&manifest.name);
-    let dest_exists = manifest.kind == Kind::File && out_dir.join(&name).exists();
-    let accepted = auto_accept && !(dest_exists && !overwrite);
+    let accepted = accept(&manifest);
     ch.send(&seal_val(
         &sk,
         Domain::StreamToSender,
@@ -240,7 +238,7 @@ pub async fn recv_into(
     ))
     .await?;
     if !accepted {
-        bail!("declined (destination exists; pass --overwrite)");
+        bail!("transfer declined");
     }
 
     if manifest.kind == Kind::Text {
@@ -372,9 +370,7 @@ mod tests {
         let k = key();
         let out_path = out.path().to_path_buf();
         let recv =
-            tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
-            );
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
         send_source(&mut s, &k, &source, None).await.unwrap();
         recv.await.unwrap().unwrap();
 
@@ -391,9 +387,7 @@ mod tests {
         let k = key();
         let out_path = out.path().to_path_buf();
         let recv =
-            tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
-            );
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
         send_source(&mut s, &k, &source, None).await.unwrap();
         recv.await.unwrap().unwrap();
         assert_eq!(std::fs::read(out.path().join("empty.bin")).unwrap(), b"");
@@ -412,9 +406,7 @@ mod tests {
         let k = key();
         let out_path = out.path().to_path_buf();
         let recv =
-            tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
-            );
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
         send_source(&mut s, &k, &source, None).await.unwrap();
         recv.await.unwrap().unwrap();
 
@@ -436,9 +428,7 @@ mod tests {
         let k = key();
         let out_path = out.path().to_path_buf();
         let recv =
-            tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
-            );
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
         let desc = send_source(&mut s, &k, &source, None).await.unwrap();
         let got = recv.await.unwrap().unwrap();
         assert_eq!(desc, "text delivered");
@@ -449,7 +439,7 @@ mod tests {
     async fn declined_transfer_reports_cleanly() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
-        // pre-create the destination so auto_accept without overwrite declines
+        // pre-create the destination; the accept callback declines regardless
         std::fs::write(src.path().join("f.bin"), b"data").unwrap();
         std::fs::write(out.path().join("f.bin"), b"old").unwrap();
         let source = archive::prepare(&[src.path().join("f.bin")]).unwrap();
@@ -459,7 +449,7 @@ mod tests {
         let out_path = out.path().to_path_buf();
         let recv =
             tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
+                async move { recv_into(&mut r, &key(), &out_path, |_| false, None).await },
             );
         let sent = send_source(&mut s, &k, &source, None).await;
         let _ = recv.await.unwrap();
@@ -524,9 +514,7 @@ mod tests {
         let k = key();
         let out_path = out.path().to_path_buf();
         let recv =
-            tokio::spawn(
-                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
-            );
+            tokio::spawn(async move { recv_into(&mut r, &key(), &out_path, |_| true, None).await });
         let sent = send_source(&mut s, &k, &source, None).await;
         let _ = recv.await.unwrap(); // receiver also reports the mismatch as an error
         assert!(
@@ -545,7 +533,7 @@ mod tests {
         let out_path = out.path().to_path_buf();
         // receiver holds a DIFFERENT key
         let recv = tokio::spawn(async move {
-            recv_into(&mut r, &SessionKey([9u8; 32]), &out_path, true, false, None).await
+            recv_into(&mut r, &SessionKey([9u8; 32]), &out_path, |_| true, None).await
         });
         let _ = send_source(&mut s, &SessionKey([7u8; 32]), &source, None).await;
         assert!(recv.await.unwrap().is_err());
