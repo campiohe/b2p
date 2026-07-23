@@ -28,6 +28,13 @@ impl SessionKey {
     pub fn stream_key(&self) -> [u8; 32] {
         blake3::derive_key("b2p-v2 stream key v1", &self.0)
     }
+
+    /// Subkey for encrypting signaling (SDP/ICE) that transits the rendezvous,
+    /// so an untrusted rendezvous never sees peer IPs. Independent of the
+    /// payload stream key.
+    pub fn signaling_key(&self) -> [u8; 32] {
+        blake3::derive_key("b2p-v2 signaling key v1", &self.0)
+    }
 }
 
 pub struct Pake {
@@ -155,5 +162,13 @@ mod tests {
         assert_eq!(k.stream_key(), SessionKey([3u8; 32]).stream_key());
         assert_ne!(k.stream_key(), k.0); // not the raw session key
         assert_ne!(k.stream_key(), SessionKey([4u8; 32]).stream_key());
+    }
+
+    #[test]
+    fn signaling_key_distinct_from_stream_and_session() {
+        let k = SessionKey([5u8; 32]);
+        assert_eq!(k.signaling_key(), SessionKey([5u8; 32]).signaling_key()); // deterministic
+        assert_ne!(k.signaling_key(), k.0);
+        assert_ne!(k.signaling_key(), k.stream_key()); // independent subkeys
     }
 }

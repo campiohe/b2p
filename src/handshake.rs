@@ -16,7 +16,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) const KIND_PAKE: u8 = 1;
 pub(crate) const KIND_CONFIRM: u8 = 2;
-// KIND 3.. reserved for P1c SDP/ICE frames.
+#[allow(dead_code)]
+pub(crate) const KIND_SDP: u8 = 3;
+#[allow(dead_code)]
+pub(crate) const KIND_ICE: u8 = 4;
 
 pub(crate) fn role_byte(r: Role) -> u8 {
     match r {
@@ -275,5 +278,13 @@ mod tests {
         assert_eq!(p, b"payload");
         assert!(decode_frame(&[]).is_none());
         assert!(decode_frame(&[1]).is_none());
+    }
+
+    #[test]
+    fn signaling_frame_kinds_are_distinct() {
+        assert_ne!(KIND_SDP, KIND_ICE);
+        assert_ne!(KIND_SDP, KIND_PAKE);
+        assert_ne!(KIND_SDP, KIND_CONFIRM);
+        assert_ne!(KIND_ICE, KIND_CONFIRM);
     }
 }

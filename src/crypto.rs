@@ -91,6 +91,40 @@ pub fn open(
         .map_err(|_| CryptoError)
 }
 
+/// Seal with a fresh random 192-bit nonce, prepended to the ciphertext.
+/// Use for messages with no natural monotonic index (e.g. trickled ICE
+/// candidates). XChaCha20's nonce is large enough that random nonces are
+/// collision-safe.
+pub fn seal_random(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("encryption is infallible for in-memory buffers");
+    let mut out = Vec::with_capacity(24 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
+pub fn open_random(key: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if ciphertext.len() < 24 {
+        return Err(CryptoError);
+    }
+    let (nonce, body) = ciphertext.split_at(24);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: body, aad })
+        .map_err(|_| CryptoError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +194,21 @@ mod tests {
             open(&k, Domain::StreamToReceiver, 0, b"", &a).unwrap(),
             b"frame"
         );
+    }
+
+    #[test]
+    fn random_nonce_seal_round_trip_and_uniqueness() {
+        let k = key();
+        let a = seal_random(&k, b"aad", b"sdp offer");
+        let b = seal_random(&k, b"aad", b"sdp offer");
+        assert_ne!(a, b, "random nonce -> different ciphertext each time");
+        assert_eq!(open_random(&k, b"aad", &a).unwrap(), b"sdp offer");
+        // tamper + wrong aad + truncation all fail
+        let mut t = a.clone();
+        let last = t.len() - 1;
+        t[last] ^= 1;
+        assert!(open_random(&k, b"aad", &t).is_err());
+        assert!(open_random(&k, b"other", &a).is_err());
+        assert!(open_random(&k, b"aad", &a[..10]).is_err());
     }
 }
