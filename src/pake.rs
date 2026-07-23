@@ -19,6 +19,12 @@ pub struct SessionKey(pub [u8; 32]);
 impl SessionKey {
     /// Subkey for the AEAD payload stream (design §4.3). Independent of the
     /// raw session key so the two are never used as the same AEAD key.
+    ///
+    /// SECURITY: at most ONE transfer per SessionKey. `stream_key` is
+    /// deterministic and the stream frame indices restart at 0 each transfer, so
+    /// running two transfers under one SessionKey reuses (key, nonce) pairs. A
+    /// retry must run a fresh PAKE handshake (which yields a new SessionKey),
+    /// never resend on a cached key.
     pub fn stream_key(&self) -> [u8; 32] {
         blake3::derive_key("b2p-v2 stream key v1", &self.0)
     }

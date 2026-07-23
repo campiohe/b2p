@@ -112,6 +112,7 @@ fn stream_manifest(source: &Source) -> Manifest {
     }
 }
 
+/// Call at most once per SessionKey — see `SessionKey::stream_key`.
 pub async fn send_source(
     ch: &mut dyn MsgChannel,
     key: &SessionKey,
@@ -175,6 +176,7 @@ pub async fn send_source(
     Ok("transfer complete".to_string())
 }
 
+/// Call at most once per SessionKey — see `SessionKey::stream_key`.
 pub async fn recv_into(
     ch: &mut dyn MsgChannel,
     key: &SessionKey,
@@ -201,6 +203,25 @@ pub async fn recv_into(
         ))
         .await?;
         bail!("protocol version mismatch");
+    }
+    // Kind::Text carries no payload frames (it completes at the manifest), so
+    // it's exempt from the frame-size check.
+    if manifest.kind != Kind::Text && manifest.chunk_size != STREAM_FRAME_SIZE {
+        ch.send(&seal_val(
+            &sk,
+            Domain::StreamToSender,
+            0,
+            &ManifestAck {
+                accepted: false,
+                complete: false,
+                have: vec![],
+            },
+        ))
+        .await?;
+        bail!(
+            "unexpected frame size {} (stream expects {STREAM_FRAME_SIZE})",
+            manifest.chunk_size
+        );
     }
 
     // 2. accept decision (auto for now; P1e adds the interactive prompt)  (StreamToSender, index 0)
@@ -361,6 +382,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trips_an_empty_file() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("empty.bin"), b"").unwrap();
+        let source = archive::prepare(&[src.path().join("empty.bin")]).unwrap();
+        let (mut s, mut r) = pipe();
+        let k = key();
+        let out_path = out.path().to_path_buf();
+        let recv =
+            tokio::spawn(
+                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
+            );
+        send_source(&mut s, &k, &source, None).await.unwrap();
+        recv.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(out.path().join("empty.bin")).unwrap(), b"");
+    }
+
+    #[tokio::test]
     async fn round_trips_a_folder_tar() {
         let src = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
@@ -402,8 +441,8 @@ mod tests {
             );
         let desc = send_source(&mut s, &k, &source, None).await.unwrap();
         let got = recv.await.unwrap().unwrap();
-        assert!(desc.contains("text") || desc.contains("delivered"));
-        assert!(got.contains("hunter2") || got.contains("text"));
+        assert_eq!(desc, "text delivered");
+        assert_eq!(got, "the wifi password is hunter2");
     }
 
     #[tokio::test]
@@ -427,6 +466,73 @@ mod tests {
         assert!(sent.is_err(), "sender should see the decline");
         // destination untouched
         assert_eq!(std::fs::read(out.path().join("f.bin")).unwrap(), b"old");
+    }
+
+    /// Wraps a `Pipe` and, after the `tamper_at`-th frame it forwards, rewrites
+    /// the source file on disk. This is *not* in-flight ciphertext tampering:
+    /// each stream frame is XChaCha20-Poly1305 AEAD, so a bit-flipped
+    /// ciphertext fails the auth tag and surfaces as a decrypt error rather
+    /// than a silently-wrong plaintext — there is no way to reach the
+    /// hash-mismatch path by corrupting bytes on the wire. Rewriting the
+    /// source file between the last payload frame and the sender's
+    /// `blake3_file` call exercises the genuine mismatch path instead: the
+    /// receiver stages exactly what was sent (matches the old content), but
+    /// the commit carries a hash of the new content.
+    struct TamperPipe {
+        inner: Pipe,
+        sends: u64,
+        tamper_at: u64,
+        path: std::path::PathBuf,
+        new_content: Vec<u8>,
+    }
+    #[async_trait]
+    impl MsgChannel for TamperPipe {
+        async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
+            self.sends += 1;
+            self.inner.send(msg).await?;
+            if self.sends == self.tamper_at {
+                std::fs::write(&self.path, &self.new_content)?;
+            }
+            Ok(())
+        }
+        async fn recv(&mut self) -> anyhow::Result<Vec<u8>> {
+            self.inner.recv().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_after_send_fails_the_transfer() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let file_path = src.path().join("f.bin");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let source = archive::prepare(&[file_path.clone()]).unwrap();
+        let total_chunks = match &source {
+            archive::Source::Blob { total_size, .. } => total_size.div_ceil(STREAM_FRAME_SIZE),
+            _ => unreachable!(),
+        };
+
+        let (s, r) = pipe();
+        let mut s = TamperPipe {
+            inner: s,
+            sends: 0,
+            tamper_at: 1 + total_chunks, // manifest + the last payload frame
+            path: file_path,
+            new_content: b"HELLO!".to_vec(),
+        };
+        let mut r = r;
+        let k = key();
+        let out_path = out.path().to_path_buf();
+        let recv =
+            tokio::spawn(
+                async move { recv_into(&mut r, &key(), &out_path, true, false, None).await },
+            );
+        let sent = send_source(&mut s, &k, &source, None).await;
+        let _ = recv.await.unwrap(); // receiver also reports the mismatch as an error
+        assert!(
+            sent.is_err(),
+            "sender should see the receiver's hash-mismatch failure"
+        );
     }
 
     #[tokio::test]
