@@ -188,28 +188,44 @@ async fn tls_check(cafile: Option<PathBuf>) -> Check {
 
 async fn stun_check() -> Check {
     let label = "UDP/STUN".to_string();
-    for server in STUN_SERVERS {
-        if crate::stun::probe(server, Duration::from_secs(3))
-            .await
-            .is_ok()
-        {
-            return Check {
-                name: "stun",
-                label,
-                outcome: Outcome::Ok,
-                detail: format!(
-                    "binding response from {server} — UDP egress works (v2 WebRTC viable)"
-                ),
-            };
-        }
-    }
-    Check {
+    let make = |outcome, detail: String| Check {
         name: "stun",
-        label,
-        outcome: Outcome::Warn,
-        detail: "no STUN response — UDP likely blocked (harmless for the tunnel transport; \
-                 matters for v2 WebRTC)"
-            .into(),
+        label: label.clone(),
+        outcome,
+        detail,
+    };
+    // Query both STUN servers from ONE socket and compare mapped ports — a
+    // reachability-only probe passes behind a symmetric NAT that then fails
+    // every cross-network transfer (the false all-clear this check closes).
+    match crate::stun::nat_mapping(&STUN_SERVERS, Duration::from_secs(3)).await {
+        crate::stun::NatMapping::EndpointIndependent(addr) => make(
+            Outcome::Ok,
+            format!(
+                "UDP egress works; mapped to {addr} from every STUN server — \
+                 endpoint-independent NAT, direct WebRTC viable"
+            ),
+        ),
+        crate::stun::NatMapping::OneResponse(addr) => make(
+            Outcome::Ok,
+            format!(
+                "UDP egress works (mapped to {addr}; only one STUN server answered, so NAT \
+                 mapping is unclassified) — WebRTC likely viable"
+            ),
+        ),
+        crate::stun::NatMapping::Symmetric(ports) => make(
+            Outcome::Warn,
+            format!(
+                "UDP egress works, but this NAT is symmetric (mapped ports differ: {ports:?}) — \
+                 direct WebRTC to another NAT'd peer will likely fail; use a TURN relay (--turn) \
+                 or --tunnel"
+            ),
+        ),
+        crate::stun::NatMapping::NoResponse => make(
+            Outcome::Warn,
+            "no STUN response — UDP likely blocked (harmless for the tunnel transport; \
+             matters for v2 WebRTC)"
+                .into(),
+        ),
     }
 }
 
@@ -260,6 +276,17 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
         return "HTTPS egress looks restricted (the rendezvous host is unreachable) — \
                 transfers may still work if the tunnel host is reachable; otherwise use \
                 --direct on a shared LAN"
+            .into();
+    }
+    // A symmetric NAT passes every layer above yet breaks direct WebRTC — the
+    // one case where "no blockers found" would be a false all-clear.
+    if checks
+        .iter()
+        .any(|c| c.name == "stun" && c.outcome == Outcome::Warn && c.detail.contains("symmetric"))
+    {
+        return "every layer is clean, but this network's NAT is symmetric — direct WebRTC to \
+                another NAT'd peer will likely fail. Use a TURN relay (--turn), --tunnel, or put \
+                both peers on the same LAN"
             .into();
     }
     "no blockers found — DNS, TLS, and HTTPS reachability look clean".into()
@@ -313,6 +340,26 @@ mod tests {
         ];
         let v = verdict(&checks, "example.com");
         assert!(v.contains("--cafile"), "{v}");
+    }
+
+    #[test]
+    fn symmetric_nat_warns_in_verdict() {
+        let checks = vec![
+            check("dns", Outcome::Ok),
+            check("tls", Outcome::Ok),
+            Check {
+                name: "stun",
+                label: "UDP/STUN".into(),
+                outcome: Outcome::Warn,
+                detail: "UDP egress works, but this NAT is symmetric (mapped ports differ: \
+                         [3828, 29126])"
+                    .into(),
+            },
+            check("rendezvous", Outcome::Ok),
+        ];
+        let v = verdict(&checks, "example.com");
+        assert!(v.contains("symmetric"), "{v}");
+        assert!(v.contains("--turn"), "{v}");
     }
 
     #[test]

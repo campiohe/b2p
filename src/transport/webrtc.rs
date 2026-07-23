@@ -427,9 +427,13 @@ pub async fn connect(
         }
         Err(_) => {
             let _ = pc.close().await;
+            // Reaching here means the PAKE handshake already succeeded (connect
+            // runs after it), so both peers met over signaling — what failed is
+            // forming a direct UDP media path, the classic symmetric-NAT case.
             anyhow::bail!(
-                "WebRTC did not connect in time — UDP/STUN may be blocked; \
-                 run `b2p doctor`, try --tunnel, or connect on the same LAN"
+                "connected to the peer over signaling, but no direct UDP path formed in time \
+                 — likely a symmetric NAT on one side. Retry with a TURN relay \
+                 (--turn turn:HOST:PORT), use --tunnel, or put both peers on the same LAN"
             )
         }
     }

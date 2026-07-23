@@ -19,8 +19,11 @@ const STUN_SERVERS: [&str; 2] = [
 /// exchange SDP/ICE for the P1 stack.
 const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
 /// How long to wait for the WebRTC connection to form before giving up and
-/// running the doctor.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// running the doctor. Bounds the *whole* negotiation (ntfy subscribe, SDP
+/// offer/answer, ICE trickle + connectivity checks, DTLS, SCTP), so a
+/// slow-but-viable WAN path needs headroom; the extra wait is only felt on
+/// failure.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The STUN defaults as a single `IceServer` (no credentials). TURN entries are
 /// appended in `ice_servers` (Task 3).
