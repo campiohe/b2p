@@ -506,7 +506,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let file_path = src.path().join("f.bin");
         std::fs::write(&file_path, b"hello").unwrap();
-        let source = archive::prepare(&[file_path.clone()]).unwrap();
+        let source = archive::prepare(std::slice::from_ref(&file_path)).unwrap();
         let total_chunks = match &source {
             archive::Source::Blob { total_size, .. } => total_size.div_ceil(STREAM_FRAME_SIZE),
             _ => unreachable!(),

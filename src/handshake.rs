@@ -16,9 +16,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) const KIND_PAKE: u8 = 1;
 pub(crate) const KIND_CONFIRM: u8 = 2;
-#[allow(dead_code)]
 pub(crate) const KIND_SDP: u8 = 3;
-#[allow(dead_code)]
 pub(crate) const KIND_ICE: u8 = 4;
 
 pub(crate) fn role_byte(r: Role) -> u8 {
