@@ -55,6 +55,20 @@ impl MsgChannel for WebRtcChannel {
     }
 }
 
+impl Drop for WebRtcChannel {
+    fn drop(&mut self) {
+        // RTCPeerConnection has no Drop impl of its own; close() is the only
+        // clean teardown (stops ICE/DTLS/SCTP + internal tasks). Best-effort:
+        // skip if we're not inside a tokio runtime (e.g. during process exit).
+        let pc = self._pc.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = pc.close().await;
+            });
+        }
+    }
+}
+
 fn build_pc_config(stun_servers: &[String]) -> RTCConfiguration {
     RTCConfiguration {
         ice_servers: if stun_servers.is_empty() {
@@ -137,9 +151,28 @@ pub async fn connect(
     stun_servers: &[String],
     timeout: Duration,
 ) -> anyhow::Result<WebRtcChannel> {
-    let sig_key = key.signaling_key();
     let pc = build_pc(stun_servers).await?;
-    wire_local_ice(&pc, rv.clone(), topic.to_string(), sig_key, role);
+    match connect_inner(&pc, rv, topic, key, role, timeout).await {
+        Ok((dc, rx)) => Ok(WebRtcChannel { dc, rx, _pc: pc }),
+        Err(e) => {
+            // Ensure ICE/DTLS/SCTP + internal tasks are torn down on any
+            // failed establishment, not just leaked until process exit.
+            let _ = pc.close().await;
+            Err(e)
+        }
+    }
+}
+
+async fn connect_inner(
+    pc: &Arc<RTCPeerConnection>,
+    rv: Arc<dyn Rendezvous>,
+    topic: &str,
+    key: &SessionKey,
+    role: Role,
+    timeout: Duration,
+) -> anyhow::Result<(Arc<RTCDataChannel>, mpsc::Receiver<Vec<u8>>)> {
+    let sig_key = key.signaling_key();
+    wire_local_ice(pc, rv.clone(), topic.to_string(), sig_key, role);
 
     let open = Arc::new(Notify::new());
     // channel handle differs by role: receiver creates it, sender receives it.
@@ -173,6 +206,10 @@ pub async fn connect(
     let pump_topic = topic.to_string();
     let want_role = role_byte(other(role));
     let pump = tokio::spawn(async move {
+        // Candidates can trickle in before we've processed the remote SDP;
+        // add_ice_candidate errors immediately (doesn't queue) without a
+        // remote description set, so buffer and flush once it lands.
+        let mut pending_ice: Vec<RTCIceCandidateInit> = Vec::new();
         while let Some(frame) = sub.next().await {
             let Some((kind, r, payload)) = decode_frame(&frame) else {
                 continue;
@@ -190,6 +227,9 @@ pub async fn connect(
                 if pump_pc.set_remote_description(sdp).await.is_err() {
                     continue;
                 }
+                for cand in pending_ice.drain(..) {
+                    let _ = pump_pc.add_ice_candidate(cand).await;
+                }
                 // The Sender is the answerer: on the offer, create + publish the answer.
                 if role == Role::Sender {
                     if let Ok(answer) = pump_pc.create_answer(None).await {
@@ -205,7 +245,11 @@ pub async fn connect(
                 }
             } else if kind == KIND_ICE {
                 if let Ok(init) = serde_json::from_slice::<RTCIceCandidateInit>(&plain) {
-                    let _ = pump_pc.add_ice_candidate(init).await;
+                    if pump_pc.remote_description().await.is_some() {
+                        let _ = pump_pc.add_ice_candidate(init).await;
+                    } else {
+                        pending_ice.push(init);
+                    }
                 }
             }
         }
@@ -232,8 +276,11 @@ pub async fn connect(
         .recv()
         .await
         .context("data channel opened but handle was lost")?;
+    // Stops applying further trickled ICE once the channel is open; fine for
+    // a one-shot transfer — connection migration / better candidate pairs
+    // are out of scope for P1.
     pump.abort();
-    Ok(WebRtcChannel { dc, rx, _pc: pc })
+    Ok((dc, rx))
 }
 
 #[cfg(test)]
