@@ -55,21 +55,18 @@ struct Cli {
 /// credentials (design §3.1), so either peer may set these independently.
 #[derive(clap::Args, Clone)]
 struct TurnArgs {
-    /// TURN relay URL (turn:/turns:); repeat for several. Needs --turn-secret or --turn-user/--turn-pass.
+    /// TURN relay URL (turn: UDP only — webrtc-ice can't do TLS/TCP). Repeat for several.
     #[arg(long = "turn")]
     turn: Vec<String>,
     /// coturn use-auth-secret shared secret; b2p mints a short-lived credential.
-    #[arg(long, conflicts_with_all = ["turn_user", "turn_pass", "turn_public"])]
+    #[arg(long, conflicts_with_all = ["turn_user", "turn_pass"])]
     turn_secret: Option<String>,
     /// Static TURN username (requires --turn-pass).
-    #[arg(long, requires = "turn_pass", conflicts_with_all = ["turn_secret", "turn_public"])]
+    #[arg(long, requires = "turn_pass", conflicts_with = "turn_secret")]
     turn_user: Option<String>,
     /// Static TURN password (requires --turn-user).
-    #[arg(long, requires = "turn_user", conflicts_with_all = ["turn_secret", "turn_public"])]
+    #[arg(long, requires = "turn_user", conflicts_with = "turn_secret")]
     turn_pass: Option<String>,
-    /// Use a bundled best-effort free relay (Open Relay). Opt-in; may be unreliable.
-    #[arg(long, conflicts_with_all = ["turn", "turn_secret", "turn_user", "turn_pass"])]
-    turn_public: bool,
 }
 
 impl TurnArgs {
@@ -81,7 +78,6 @@ impl TurnArgs {
             self.turn_secret.as_deref(),
             self.turn_user.as_deref(),
             self.turn_pass.as_deref(),
-            self.turn_public,
             &nonce,
         )
     }
@@ -531,16 +527,33 @@ mod tests {
     #[test]
     fn turn_flags_validate() {
         use clap::Parser;
-        // --turn-public conflicts with --turn-secret
-        assert!(Cli::try_parse_from(["b2p", "receive", "--turn-public", "--turn-secret", "s"]).is_err());
         // --turn-user requires --turn-pass
         assert!(Cli::try_parse_from(["b2p", "receive", "--turn-user", "u"]).is_err());
-        // valid: --turn + --turn-secret on send
+        // --turn-secret conflicts with static creds
         assert!(Cli::try_parse_from([
-            "b2p", "send", "7-a-b", "f", "--turn", "turns:h:443?transport=tcp", "--turn-secret", "s"
+            "b2p", "receive", "--turn-secret", "s", "--turn-user", "u", "--turn-pass", "p"
         ])
-        .is_ok());
-        // --turn with no creds parses at clap level but fails at resolve()
+        .is_err());
+        // valid: udp turn: + --turn-secret on send
+        let cli = Cli::try_parse_from([
+            "b2p", "send", "7-a-b", "f", "--turn", "turn:h:3478", "--turn-secret", "s",
+        ])
+        .unwrap();
+        if let Cmd::Send { turn, .. } = cli.cmd {
+            assert!(turn.resolve().is_ok());
+        } else {
+            panic!("expected send");
+        }
+        // turns: (TLS) rejected at resolve() — webrtc-ice is UDP-only
+        let cli =
+            Cli::try_parse_from(["b2p", "receive", "--turn", "turns:h:5349", "--turn-secret", "s"])
+                .unwrap();
+        if let Cmd::Receive { turn, .. } = cli.cmd {
+            assert!(turn.resolve().is_err());
+        } else {
+            panic!("expected receive");
+        }
+        // --turn with no creds fails at resolve()
         let cli = Cli::try_parse_from(["b2p", "receive", "--turn", "turn:h:3478"]).unwrap();
         if let Cmd::Receive { turn, .. } = cli.cmd {
             assert!(turn.resolve().is_err());

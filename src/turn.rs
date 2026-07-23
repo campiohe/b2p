@@ -6,6 +6,12 @@
 //! webrtc crate's `RTCIceServer`. Only the peer that *allocates* a relay
 //! authenticates; the other peer reaches the allocated address as an ordinary
 //! ICE candidate with no credentials (design §3.1).
+//!
+//! **UDP only.** `webrtc-ice` (all published versions, incl. 0.17.2) implements
+//! TURN over UDP alone — `turns:` (TLS) and `?transport=tcp` are unimplemented
+//! upstream and would silently gather no relay candidate. We reject those URLs
+//! loudly. So TURN here traverses symmetric NAT where UDP egress works; for
+//! UDP-*blocked* networks the answer is the HTTPS relay (P2b), not TURN.
 
 use anyhow::bail;
 use base64::Engine;
@@ -28,17 +34,6 @@ pub struct IceServer {
 /// code-expiry window (design §3.2).
 const EPHEMERAL_TTL_SECS: u64 = 600;
 
-/// Bundled best-effort free relay for `--turn-public` (Open Relay / metered.ca).
-/// Best-effort only: a third-party, rate-limited service that may change or
-/// disappear — hence opt-in, never automatic (design §5).
-const PUBLIC_TURN_URLS: [&str; 3] = [
-    "turn:openrelay.metered.ca:80",
-    "turn:openrelay.metered.ca:443?transport=tcp",
-    "turns:openrelay.metered.ca:443?transport=tcp",
-];
-const PUBLIC_TURN_USER: &str = "openrelayproject";
-const PUBLIC_TURN_PASS: &str = "openrelayproject";
-
 /// Mint a coturn `use-auth-secret` credential:
 /// `username = "{expiry_unix}:{nonce}"`, `credential = base64(HMAC_SHA1(secret, username))`.
 /// Pure/deterministic in its inputs (caller supplies `nonce`/`expiry`) so it is
@@ -60,6 +55,29 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Reject TURN URLs the WebRTC engine can't actually use. `webrtc-ice` gathers
+/// relay candidates over UDP only; `turns:` (TLS) and `?transport=tcp` are
+/// unimplemented upstream and would silently yield no candidate — so fail loudly
+/// and point at the HTTPS relay for UDP-blocked networks.
+fn validate_turn_url(url: &str) -> anyhow::Result<()> {
+    if url.starts_with("turns:") {
+        bail!(
+            "TURN over TLS ({url}) is not supported by the current WebRTC engine \
+             (webrtc-ice is UDP-only). For a UDP-blocked network, use the HTTPS relay instead."
+        );
+    }
+    if url.contains("transport=tcp") {
+        bail!(
+            "TURN over TCP ({url}) is not supported by the current WebRTC engine \
+             (webrtc-ice is UDP-only). Use a udp turn: URL, or the HTTPS relay for UDP-blocked networks."
+        );
+    }
+    if !url.starts_with("turn:") {
+        bail!("--turn expects a turn: (UDP) URL, got: {url}");
+    }
+    Ok(())
+}
+
 /// Resolve the TURN CLI flags into ICE servers to append to the STUN defaults.
 /// Empty vec when no TURN is configured (STUN-only — unchanged default). `nonce`
 /// disambiguates concurrent allocations; the caller supplies a random one.
@@ -68,11 +86,13 @@ pub fn resolve(
     secret: Option<&str>,
     user: Option<&str>,
     pass: Option<&str>,
-    public: bool,
     nonce: &str,
 ) -> anyhow::Result<Vec<IceServer>> {
     let mut servers = Vec::new();
     if !turn_urls.is_empty() {
+        for u in turn_urls {
+            validate_turn_url(u)?;
+        }
         let (username, credential) = match (secret, user, pass) {
             (Some(s), None, None) => {
                 ephemeral_credential(s, nonce, now_unix() + EPHEMERAL_TTL_SECS)
@@ -89,13 +109,6 @@ pub fn resolve(
             credential,
         });
     }
-    if public {
-        servers.push(IceServer {
-            urls: PUBLIC_TURN_URLS.iter().map(|s| s.to_string()).collect(),
-            username: PUBLIC_TURN_USER.to_string(),
-            credential: PUBLIC_TURN_PASS.to_string(),
-        });
-    }
     Ok(servers)
 }
 
@@ -106,7 +119,7 @@ mod tests {
     #[test]
     fn ephemeral_credential_matches_known_answer() {
         // HMAC-SHA1("topsecret", "1700000000:b2p") -> base64, cross-checked with
-        // an independent tool (python `hmac`). coturn computes the same value.
+        // an independent tool (python `hmac`) AND against a live coturn.
         let (username, cred) = ephemeral_credential("topsecret", "b2p", 1_700_000_000);
         assert_eq!(username, "1700000000:b2p");
         assert_eq!(cred, "MMEmLNCfJ3NvrGNM+eBdFp5wwps=");
@@ -114,13 +127,13 @@ mod tests {
 
     #[test]
     fn resolve_no_flags_is_empty() {
-        assert!(resolve(&[], None, None, None, false, "n").unwrap().is_empty());
+        assert!(resolve(&[], None, None, None, "n").unwrap().is_empty());
     }
 
     #[test]
     fn resolve_turn_with_secret_mints_ephemeral() {
-        let urls = vec!["turns:turn.example.com:443?transport=tcp".to_string()];
-        let s = resolve(&urls, Some("sekret"), None, None, false, "nonce123").unwrap();
+        let urls = vec!["turn:turn.example.com:3478".to_string()];
+        let s = resolve(&urls, Some("sekret"), None, None, "nonce123").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].urls, urls);
         assert!(s[0].username.ends_with(":nonce123"));
@@ -130,7 +143,7 @@ mod tests {
     #[test]
     fn resolve_turn_with_static_creds() {
         let urls = vec!["turn:turn.example.com:3478".to_string()];
-        let s = resolve(&urls, None, Some("alice"), Some("pw"), false, "n").unwrap();
+        let s = resolve(&urls, None, Some("alice"), Some("pw"), "n").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].username, "alice");
         assert_eq!(s[0].credential, "pw");
@@ -139,14 +152,20 @@ mod tests {
     #[test]
     fn resolve_turn_without_creds_errors() {
         let urls = vec!["turn:turn.example.com:3478".to_string()];
-        assert!(resolve(&urls, None, None, None, false, "n").is_err());
+        assert!(resolve(&urls, None, None, None, "n").is_err());
     }
 
     #[test]
-    fn resolve_public_adds_open_relay() {
-        let s = resolve(&[], None, None, None, true, "n").unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].username, "openrelayproject");
-        assert!(s[0].urls.iter().any(|u| u.starts_with("turns:")));
+    fn resolve_rejects_tls_and_tcp() {
+        // webrtc-ice is UDP-only: turns: and ?transport=tcp must fail loudly.
+        assert!(resolve(&["turns:h:5349".into()], Some("s"), None, None, "n").is_err());
+        assert!(resolve(
+            &["turn:h:3478?transport=tcp".into()],
+            Some("s"),
+            None,
+            None,
+            "n"
+        )
+        .is_err());
     }
 }
