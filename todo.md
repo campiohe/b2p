@@ -23,6 +23,17 @@ spec phase they belong to. See `b2p-v2-spec.md` and
       coturn. See `docs/superpowers/specs/2026-07-23-b2p-v2-p2a-turn-design.md`.
 - [x] **Send-side SCTP stall guard** — `WebRtcChannel::send` now races `dc.send`
       against a close latch, so a dead peer surfaces as `Err` instead of hanging.
+- [x] **`doctor` detects symmetric NAT** (network casefile) — `stun::nat_mapping`
+      probes two STUN servers from one socket and compares mapped ports, closing
+      the "no blockers found" false all-clear; connect-timeout error now names
+      symmetric NAT + `--turn`; `CONNECT_TIMEOUT` 20s→45s.
+- [x] **`--tunnel` dead-code hang fixed** (casefile Issue 2) — `parse_tunnel_url`
+      no longer scrapes cloudflared's error line; `start_cloudflared` fails fast.
+- [ ] **Receiver-side DoH for the tunnel registration** — cloudflared registers
+      the quick tunnel itself and offers no resolver override, so the sender's DoH
+      can't help it on a DNS-filtered network. Would mean registering the tunnel
+      ourselves and handing cloudflared a named tunnel — a big change, low
+      priority now that `--tunnel` fails fast and the WebRTC+TURN path exists.
 - [ ] **TURN over TCP/TLS is blocked upstream** — `webrtc-ice` (0.17.2, newest
       published) gathers relay candidates over UDP only; `turns:`/`?transport=tcp`
       are commented-out TODOs, so b2p rejects them. This means TURN does **not**
