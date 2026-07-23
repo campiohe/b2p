@@ -376,6 +376,13 @@ async fn do_send(
         Dest::Tunnel(Code::parse(&code).context("invalid code — paste it exactly as printed")?)
     };
 
+    // Resolve TURN before the (possibly long) tar so a bad --turn combo fails
+    // fast, mirroring the code parse above. It only applies to the WebRTC path.
+    let ice = ice_servers(&turn)?;
+    if !turn.turn.is_empty() && matches!(dest, Dest::Tunnel(_)) {
+        eprintln!("note: --turn only applies to the WebRTC path; ignoring it for this tunnel code");
+    }
+
     let source = match &text {
         Some(t) => archive::prepare_text(t),
         None => {
@@ -388,7 +395,6 @@ async fn do_send(
             let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
             let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
                 Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-            let ice = ice_servers(&turn)?;
             let bar = match &source {
                 archive::Source::Blob { total_size, .. } => {
                     Some(progress::transfer_bar(*total_size))

@@ -97,20 +97,68 @@ pub enum NatMapping {
     /// ≥2 servers answered with the SAME mapped port — endpoint-independent
     /// (cone) NAT or open internet; direct WebRTC is viable.
     EndpointIndependent(SocketAddr),
-    /// ≥2 servers answered with DIFFERENT mapped ports — symmetric NAT; a
-    /// reflexive candidate points at a port the peer cannot reach, so STUN-only
-    /// hole punching to another NATed peer fails.
-    Symmetric(Vec<u16>),
+    /// ≥2 servers answered with DIFFERENT mapped addresses (IP or port) —
+    /// symmetric NAT; a reflexive candidate points at an endpoint the peer
+    /// cannot reach, so STUN-only hole punching to another NATed peer fails.
+    Symmetric(Vec<SocketAddr>),
     /// Exactly one server answered — reachable, but mapping can't be classified.
     OneResponse(SocketAddr),
     /// No server answered — UDP egress is likely blocked.
     NoResponse,
 }
 
+/// Classify NAT mapping from the addresses observed across servers. Endpoint-
+/// independent requires the *full* mapped address (IP and port) to be identical
+/// everywhere — a port-preserving NAT that egresses via different public IPs is
+/// still endpoint-dependent, so comparing ports alone would be a false clear.
+fn classify_mapping(mapped: &[SocketAddr]) -> NatMapping {
+    match mapped {
+        [] => NatMapping::NoResponse,
+        [one] => NatMapping::OneResponse(*one),
+        _ => {
+            if mapped.iter().all(|a| a == &mapped[0]) {
+                NatMapping::EndpointIndependent(mapped[0])
+            } else {
+                NatMapping::Symmetric(mapped.to_vec())
+            }
+        }
+    }
+}
+
+/// Ask one `server` for our mapped address on `sock`. Resolves to an IPv4 peer
+/// (our socket is `0.0.0.0`, so a v6-first hostname would fail EINVAL), and
+/// keeps receiving until a datagram matching *our* transaction arrives or the
+/// deadline passes — a single blind `recv` could be eaten by a stray or late
+/// packet on this unconnected socket, misclassifying the NAT.
+async fn query_mapped(sock: &UdpSocket, server: &str, timeout: Duration) -> Option<SocketAddr> {
+    let target = tokio::net::lookup_host(server)
+        .await
+        .ok()?
+        .find(|a| a.is_ipv4())?;
+    let mut txn_id = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut txn_id);
+    sock.send_to(&encode_binding_request(&txn_id), target)
+        .await
+        .ok()?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; 256];
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let (n, _) = tokio::time::timeout(remaining, sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        if let Some(addr) = parse_xor_mapped_address(&buf[..n], &txn_id) {
+            return Some(addr);
+        }
+        // stray / late / non-matching datagram — keep waiting for our txn
+    }
+}
+
 /// Probe each `server` from a single shared UDP socket and classify the NAT's
-/// mapping behavior by comparing the observed mapped ports. This is what tells a
-/// symmetric NAT (every check green, yet every cross-network transfer fails)
-/// apart from a friendly one.
+/// mapping behavior by comparing the observed mapped addresses. This is what
+/// tells a symmetric NAT (every check green, yet every cross-network transfer
+/// fails) apart from a friendly one.
 pub async fn nat_mapping(servers: &[&str], timeout: Duration) -> NatMapping {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
@@ -118,34 +166,11 @@ pub async fn nat_mapping(servers: &[&str], timeout: Duration) -> NatMapping {
     };
     let mut mapped: Vec<SocketAddr> = Vec::new();
     for server in servers {
-        let mut txn_id = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut txn_id);
-        if sock
-            .send_to(&encode_binding_request(&txn_id), server)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        let mut buf = [0u8; 256];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await {
-            if let Some(addr) = parse_xor_mapped_address(&buf[..n], &txn_id) {
-                mapped.push(addr);
-            }
+        if let Some(addr) = query_mapped(&sock, server, timeout).await {
+            mapped.push(addr);
         }
     }
-    match mapped.len() {
-        0 => NatMapping::NoResponse,
-        1 => NatMapping::OneResponse(mapped[0]),
-        _ => {
-            let ports: Vec<u16> = mapped.iter().map(|a| a.port()).collect();
-            if ports.iter().all(|p| *p == ports[0]) {
-                NatMapping::EndpointIndependent(mapped[0])
-            } else {
-                NatMapping::Symmetric(ports)
-            }
-        }
-    }
+    classify_mapping(&mapped)
 }
 
 #[cfg(test)]
@@ -200,6 +225,25 @@ mod tests {
         );
         // a response to a different transaction is not ours
         assert!(parse_xor_mapped_address(&msg, &[9u8; 12]).is_none());
+    }
+
+    #[test]
+    fn classifies_nat_mapping() {
+        let a: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        let diff_port: SocketAddr = "203.0.113.5:40001".parse().unwrap();
+        let diff_ip: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        assert_eq!(classify_mapping(&[]), NatMapping::NoResponse);
+        assert_eq!(classify_mapping(&[a]), NatMapping::OneResponse(a));
+        assert_eq!(classify_mapping(&[a, a]), NatMapping::EndpointIndependent(a));
+        assert_eq!(
+            classify_mapping(&[a, diff_port]),
+            NatMapping::Symmetric(vec![a, diff_port])
+        );
+        // same port but a different egress IP must NOT read as endpoint-independent
+        assert_eq!(
+            classify_mapping(&[a, diff_ip]),
+            NatMapping::Symmetric(vec![a, diff_ip])
+        );
     }
 
     #[tokio::test]

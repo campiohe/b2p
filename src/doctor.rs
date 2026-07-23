@@ -212,12 +212,12 @@ async fn stun_check() -> Check {
                  mapping is unclassified) — WebRTC likely viable"
             ),
         ),
-        crate::stun::NatMapping::Symmetric(ports) => make(
+        crate::stun::NatMapping::Symmetric(addrs) => make(
             Outcome::Warn,
             format!(
-                "UDP egress works, but this NAT is symmetric (mapped ports differ: {ports:?}) — \
-                 direct WebRTC to another NAT'd peer will likely fail; use a TURN relay (--turn) \
-                 or --tunnel"
+                "UDP egress works, but this NAT is symmetric (mapped addresses differ: {addrs:?}) \
+                 — direct WebRTC to another NAT'd peer will likely fail; use a TURN relay \
+                 (--turn) or --tunnel"
             ),
         ),
         crate::stun::NatMapping::NoResponse => make(

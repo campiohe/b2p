@@ -30,9 +30,13 @@ pub struct IceServer {
     pub credential: String,
 }
 
-/// Seconds a minted ephemeral credential stays valid — aligned with the
-/// code-expiry window (design §3.2).
-const EPHEMERAL_TTL_SECS: u64 = 600;
+/// Seconds a minted ephemeral credential stays valid. Must comfortably exceed
+/// the longest a transfer might run: webrtc-rs re-authenticates TURN allocation
+/// and permission *refreshes* with the same timestamped username, so a short TTL
+/// would 401 a long relayed transfer mid-flight (coturn enforces the timestamp
+/// on refresh). 12h is ample and harmless — the human code itself is single-use
+/// and short-lived, independent of this.
+const EPHEMERAL_TTL_SECS: u64 = 12 * 60 * 60;
 
 /// Mint a coturn `use-auth-secret` credential:
 /// `username = "{expiry_unix}:{nonce}"`, `credential = base64(HMAC_SHA1(secret, username))`.
@@ -60,20 +64,28 @@ fn now_unix() -> u64 {
 /// unimplemented upstream and would silently yield no candidate — so fail loudly
 /// and point at the HTTPS relay for UDP-blocked networks.
 fn validate_turn_url(url: &str) -> anyhow::Result<()> {
-    if url.starts_with("turns:") {
-        bail!(
+    let (scheme, rest) = url.split_once(':').unwrap_or((url, ""));
+    match scheme.to_ascii_lowercase().as_str() {
+        "turns" => bail!(
             "TURN over TLS ({url}) is not supported by the current WebRTC engine \
              (webrtc-ice is UDP-only). For a UDP-blocked network, use the HTTPS relay instead."
-        );
+        ),
+        "turn" => {}
+        _ => bail!("--turn expects a turn: (UDP) URL, got: {url}"),
     }
-    if url.contains("transport=tcp") {
-        bail!(
-            "TURN over TCP ({url}) is not supported by the current WebRTC engine \
-             (webrtc-ice is UDP-only). Use a udp turn: URL, or the HTTPS relay for UDP-blocked networks."
-        );
-    }
-    if !url.starts_with("turn:") {
-        bail!("--turn expects a turn: (UDP) URL, got: {url}");
+    // Reject transport=tcp — but decode the query first, so a percent-encoded
+    // value (e.g. `transport=%74%63%70`) can't slip past and then silently
+    // gather no relay candidate in webrtc-ice's UDP-only gather.
+    if let Some((_, query)) = rest.split_once('?') {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if k.eq_ignore_ascii_case("transport") && v.eq_ignore_ascii_case("tcp") {
+                bail!(
+                    "TURN over TCP ({url}) is not supported by the current WebRTC engine \
+                     (webrtc-ice is UDP-only). Use a udp turn: URL, or the HTTPS relay for \
+                     UDP-blocked networks."
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -88,28 +100,30 @@ pub fn resolve(
     pass: Option<&str>,
     nonce: &str,
 ) -> anyhow::Result<Vec<IceServer>> {
-    let mut servers = Vec::new();
-    if !turn_urls.is_empty() {
-        for u in turn_urls {
-            validate_turn_url(u)?;
+    if turn_urls.is_empty() {
+        // Credentials with no --turn URL are a mistake, not a silent no-op — the
+        // user thinks TURN is configured, then a transfer fails STUN-only.
+        if secret.is_some() || user.is_some() || pass.is_some() {
+            bail!("TURN credentials were given but no --turn URL — add --turn turn:HOST:PORT");
         }
-        let (username, credential) = match (secret, user, pass) {
-            (Some(s), None, None) => {
-                ephemeral_credential(s, nonce, now_unix() + EPHEMERAL_TTL_SECS)
-            }
-            (None, Some(u), Some(p)) => (u.to_string(), p.to_string()),
-            _ => bail!(
-                "--turn requires credentials: either --turn-secret, \
-                 or both --turn-user and --turn-pass"
-            ),
-        };
-        servers.push(IceServer {
-            urls: turn_urls.to_vec(),
-            username,
-            credential,
-        });
+        return Ok(Vec::new());
     }
-    Ok(servers)
+    for u in turn_urls {
+        validate_turn_url(u)?;
+    }
+    let (username, credential) = match (secret, user, pass) {
+        (Some(s), None, None) => ephemeral_credential(s, nonce, now_unix() + EPHEMERAL_TTL_SECS),
+        (None, Some(u), Some(p)) => (u.to_string(), p.to_string()),
+        _ => bail!(
+            "--turn requires credentials: either --turn-secret, \
+             or both --turn-user and --turn-pass"
+        ),
+    };
+    Ok(vec![IceServer {
+        urls: turn_urls.to_vec(),
+        username,
+        credential,
+    }])
 }
 
 #[cfg(test)]
@@ -159,6 +173,7 @@ mod tests {
     fn resolve_rejects_tls_and_tcp() {
         // webrtc-ice is UDP-only: turns: and ?transport=tcp must fail loudly.
         assert!(resolve(&["turns:h:5349".into()], Some("s"), None, None, "n").is_err());
+        assert!(resolve(&["TURNS:h:5349".into()], Some("s"), None, None, "n").is_err());
         assert!(resolve(
             &["turn:h:3478?transport=tcp".into()],
             Some("s"),
@@ -167,5 +182,30 @@ mod tests {
             "n"
         )
         .is_err());
+        // percent-encoded transport=tcp must not slip past the substring check
+        assert!(resolve(
+            &["turn:h:3478?transport=%74%63%70".into()],
+            Some("s"),
+            None,
+            None,
+            "n"
+        )
+        .is_err());
+        // udp (default and explicit) is fine
+        assert!(resolve(&["turn:h:3478".into()], Some("s"), None, None, "n").is_ok());
+        assert!(resolve(
+            &["turn:h:3478?transport=udp".into()],
+            Some("s"),
+            None,
+            None,
+            "n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn resolve_creds_without_url_errors() {
+        assert!(resolve(&[], Some("s"), None, None, "n").is_err());
+        assert!(resolve(&[], None, Some("u"), Some("p"), "n").is_err());
     }
 }

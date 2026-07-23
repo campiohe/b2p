@@ -70,22 +70,31 @@ pub struct WebRtcChannel {
 #[async_trait]
 impl MsgChannel for WebRtcChannel {
     async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
-        // Fast path: already-closed before we even start the send.
+        // A `dc.send` parked on SCTP's 128 MiB backpressure semaphore never
+        // wakes if the peer died; race it against the close signal so a dead
+        // peer surfaces as a bounded Err instead of hanging forever.
+        //
+        // `notify_waiters()` only wakes waiters *already registered*, storing no
+        // permit — so the `Notified` future must be created and `enable()`d as a
+        // waiter BEFORE we read `closed_flag`. Otherwise a close detected between
+        // the flag check and the future's first poll is lost and the send hangs
+        // (the exact stall this guard exists to prevent). With this ordering,
+        // either the flag is already set (we bail) or the enabled future is
+        // registered before any `notify_waiters()` can fire (it wakes us).
+        let notified = self.closed_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.closed_flag.load(Ordering::Relaxed) {
             anyhow::bail!("data channel closed by peer");
         }
-        // A `dc.send` parked on SCTP's 128 MiB backpressure semaphore never
-        // wakes if the peer died; race it against the close signal so a dead
-        // peer surfaces as a bounded Err. `notify_waiters` wakes this
-        // already-registered `notified()` when close is detected. Bind `bytes`
-        // outside the select so it outlives the borrowed `dc.send` future.
+        // Bind `bytes` outside the select so it outlives the borrowed future.
         let bytes = Bytes::copy_from_slice(msg);
         tokio::select! {
             r = self.dc.send(&bytes) => {
                 r.context("data channel send failed")?;
                 Ok(())
             }
-            _ = self.closed_notify.notified() => {
+            _ = &mut notified => {
                 anyhow::bail!("data channel closed by peer")
             }
         }
