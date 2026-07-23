@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 blake3 = "1"
 bs58 = "0.5"
 bytes = "1"
@@ -17,7 +19,7 @@ flate2 = "1"
 futures = "0.3"
 indicatif = "0.17"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
@@ -27,7 +29,7 @@ tar = "0.4"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7" }
+tokio-util = { version = "0.7", features = ["io"] }
 url = "2"
 walkdir = "2"
 sha2 = "0.10"
