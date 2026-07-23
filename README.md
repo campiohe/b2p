@@ -34,6 +34,7 @@ releases (`https://…#…`) automatically use the Cloudflare tunnel path.
 
 Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
 `--overwrite`, `--tunnel` (use Cloudflare tunnel instead of WebRTC),
+`--direct` (with `--tunnel`: serve directly on the LAN, skipping cloudflared),
 `--rendezvous <URL>` (override signaling host; default `https://ntfy.sh`),
 `--cafile FILE` (extra root CA, both commands).
 
@@ -63,6 +64,14 @@ verdict. `b2p send` runs it automatically when it cannot reach the receiver.
   verifies all layers (DNS, TLS, UDP, HTTPS).
 - If WebRTC is blocked, use `receive --tunnel` to fall back to the Cloudflare
   path. The sender auto-detects the code type.
+- On the `--tunnel` path, if the network sinkholes the tunnel host at the DNS
+  layer (e.g. Cisco Umbrella blocking `*.trycloudflare.com`), the sender
+  re-resolves it over DNS-over-HTTPS (Cloudflare, then Google) so the connection
+  still forms, falling back to system DNS when DoH is unreachable. This is honest
+  resolution — asking a truthful resolver, not spoofing — and needs no flag. The
+  default WebRTC path never resolves a tunnel host, so it does not apply there.
+- The first `--tunnel` run downloads a pinned `cloudflared` binary (checksum-
+  verified — it refuses to run on mismatch) and reuses it on later runs.
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
 - `cargo test` runs the full offline test suite.
@@ -85,5 +94,6 @@ To cut a release:
        git tag v0.1.0
        git push origin v0.1.0
 
-The release workflow (`.github/workflows/release.yml`) cross-compiles all four
-binaries and publishes them to a GitHub Release named after the tag.
+The release workflow (`.github/workflows/release.yml`) cross-compiles all three
+binaries (Linux x86_64 musl, macOS arm64, Windows x86_64) and publishes them to
+a GitHub Release named after the tag.
