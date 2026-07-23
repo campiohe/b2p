@@ -8,19 +8,34 @@ spec phase they belong to. See `b2p-v2-spec.md` and
 
 - [ ] **Self-hostable relay + signaling binary** (`b2p relay`) — HTTPS PUT/GET
       store-and-forward; the reference relay both peers can reach over ordinary
-      HTTPS when live P2P can't form. Sees only ciphertext + an opaque id.
-- [ ] **TURN fallback** for symmetric NAT / blocked UDP: self-hosted `coturn`
-      first, ephemeral-credential provider as fallback-only, and
-      **TURN-over-TLS on 443** as the escape hatch for UDP-blocked networks.
-      `transport::webrtc::connect` already takes a STUN list — extend to TURN.
+      HTTPS when live P2P can't form. Sees only ciphertext + an opaque id. **Now
+      also the answer for UDP-blocked networks** (TURN-over-TLS is unavailable —
+      see the P2a shipped note below), so this is the next P2 sub-phase.
 - [ ] **`Transport` trait + negotiation engine** — `src/transport/mod.rs` is
       currently just `pub mod webrtc;`. Add the trait (design §4.1) and the
       per-stage-budget negotiation (design §5) so LAN / WebRTC / relay are tried
       in order instead of chosen only by code form.
-- [ ] **Send-side SCTP stall guard** — a `dc.send` parked on webrtc's 128 MiB
-      backpressure semaphore with a dead receiver never unblocks. Guard
-      `WebRtcChannel::send` with a `tokio::select!` on the close signal
-      (there's a `// TODO(p2)` marker in `src/transport/webrtc.rs`).
+
+### P2a shipped (UDP TURN + SCTP stall guard); deferred follow-ups
+
+- [x] **TURN fallback** for **symmetric NAT** — `--turn`/`--turn-secret`/
+      `--turn-user`/`--turn-pass` (UDP `turn:` only), verified against a live
+      coturn. See `docs/superpowers/specs/2026-07-23-b2p-v2-p2a-turn-design.md`.
+- [x] **Send-side SCTP stall guard** — `WebRtcChannel::send` now races `dc.send`
+      against a close latch, so a dead peer surfaces as `Err` instead of hanging.
+- [ ] **TURN over TCP/TLS is blocked upstream** — `webrtc-ice` (0.17.2, newest
+      published) gathers relay candidates over UDP only; `turns:`/`?transport=tcp`
+      are commented-out TODOs, so b2p rejects them. This means TURN does **not**
+      cover UDP-blocked networks (use the relay above). Revisit if a newer
+      `webrtc-ice` implements TCP/TLS gathering.
+- [ ] **TURN credential advertisement / borrowing** — let a zero-config peer use
+      the *other* peer's TURN server (advertise minted creds over the encrypted
+      signaling channel before ICE gathering). P2a instead has the affected peer
+      pass `--turn` (design §3.1).
+- [ ] **Precise transport in the status line** — report `via WebRTC (TURN)` vs
+      `(STUN)` by reading the selected candidate pair (P2a prints plain
+      `via WebRTC`; reading the pair type from webrtc-0.17 is not cheap).
+- [ ] **`b2p doctor` TURN reachability** when `--turn` is supplied.
 
 ## P3 — LAN, async, resume
 

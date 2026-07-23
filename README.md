@@ -36,7 +36,9 @@ Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
 `--overwrite`, `--tunnel` (use Cloudflare tunnel instead of WebRTC),
 `--direct` (with `--tunnel`: serve directly on the LAN, skipping cloudflared),
 `--rendezvous <URL>` (override signaling host; default `https://ntfy.sh`),
-`--cafile FILE` (extra root CA, both commands).
+`--cafile FILE` (extra root CA, both commands),
+`--turn turn:HOST:PORT` (UDP TURN relay for symmetric NAT) with `--turn-secret S`
+or `--turn-user U`/`--turn-pass P` (both commands).
 
 ## Resume
 
@@ -64,6 +66,12 @@ verdict. `b2p send` runs it automatically when it cannot reach the receiver.
   verifies all layers (DNS, TLS, UDP, HTTPS).
 - If WebRTC is blocked, use `receive --tunnel` to fall back to the Cloudflare
   path. The sender auto-detects the code type.
+- Behind **symmetric NAT** (no direct/STUN path forms), add a UDP TURN relay on
+  the affected peer: `--turn turn:turn.example.com:3478` plus either
+  `--turn-secret <coturn use-auth-secret>` (short-lived creds, recommended) or
+  `--turn-user U --turn-pass P` (static). Only `turn:` (UDP) URLs work — the
+  WebRTC engine can't do TURN over TLS/TCP, so a **UDP-blocked** network isn't
+  helped by TURN; a self-hostable HTTPS relay for that case is planned.
 - On the `--tunnel` path, if the network sinkholes the tunnel host at the DNS
   layer (e.g. Cisco Umbrella blocking `*.trycloudflare.com`), the sender
   re-resolves it over DNS-over-HTTPS (Cloudflare, then Google) so the connection

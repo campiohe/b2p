@@ -673,4 +673,79 @@ mod tests {
             "send should return Err once the peer disconnects, not hang"
         );
     }
+
+    // TURN / TURN-over-TLS de-risk (design §2). Points at any TURN server via
+    // env vars, so it never rots when a public relay dies. A gathered
+    // `typ relay` candidate proves the allocation (and, for `turns:`, the TLS)
+    // completed. Examples:
+    //   B2P_TURN_URL=turn:127.0.0.1:3478 B2P_TURN_SECRET=topsecret \
+    //     cargo test --lib gathers_relay_candidate_via_turn -- --ignored --nocapture
+    //   B2P_TURN_URL=turns:relay.example:5349 B2P_TURN_USER=u B2P_TURN_PASS=p \
+    //     cargo test --lib gathers_relay_candidate_via_turn -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn gathers_relay_candidate_via_turn() {
+        use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+
+        let url = std::env::var("B2P_TURN_URL").expect("set B2P_TURN_URL to run this de-risk test");
+        let (username, credential) = if let Ok(secret) = std::env::var("B2P_TURN_SECRET") {
+            let expiry = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 600;
+            crate::turn::ephemeral_credential(&secret, "smoke", expiry)
+        } else {
+            (
+                std::env::var("B2P_TURN_USER").unwrap_or_default(),
+                std::env::var("B2P_TURN_PASS").unwrap_or_default(),
+            )
+        };
+        let servers = vec![crate::turn::IceServer {
+            urls: vec![url],
+            username,
+            credential,
+        }];
+        let mut cfg = build_pc_config(&servers);
+        // Relay-only: any gathered candidate is a relay candidate, so its
+        // appearance proves the TURN allocation completed.
+        cfg.ice_transport_policy = RTCIceTransportPolicy::Relay;
+
+        let mut m = MediaEngine::default();
+        let mut registry = Registry::new();
+        registry = register_default_interceptors(registry, &mut m).unwrap();
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_interceptor_registry(registry)
+            .build();
+        let pc = Arc::new(api.new_peer_connection(cfg).await.unwrap());
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if let Some(c) = c {
+                    if let Ok(init) = c.to_json() {
+                        let _ = tx.send(init.candidate).await;
+                    }
+                }
+            })
+        }));
+        let _dc = pc.create_data_channel("b2p", None).await.unwrap();
+        let offer = pc.create_offer(None).await.unwrap();
+        pc.set_local_description(offer).await.unwrap();
+
+        let got_relay = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(cand) = rx.recv().await {
+                if cand.contains("typ relay") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let _ = pc.close().await;
+        assert!(got_relay, "expected a relay candidate from {}", servers[0].urls[0]);
+    }
 }

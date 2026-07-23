@@ -127,6 +127,7 @@ The workhorse, and confirmed viable on the proving-ground network.
   2. A TURN provider with ephemeral credentials (Cloudflare Calls / Open Relay) — this is the one spot that may need an account, so it is **fallback-only**, never the default, and only engaged when STUN-only fails.
   3. **TURN-over-TLS on 443** — doubles as the escape hatch for networks that block UDP outright (not this one, but many).
 - Rust implementation: `webrtc` crate or `str0m` (sans-I/O, easier to embed in a CLI).
+- **Implementation note (as of P2a, `webrtc` 0.17):** `webrtc-ice` gathers TURN relay candidates **over UDP only** — `turns:` (TLS) and `?transport=tcp` are unimplemented upstream. So option 3 (TURN-over-TLS-443) is **not available** in the current engine, and b2p's `--turn` accepts UDP `turn:` URLs only (verified against a live coturn). TURN therefore covers **symmetric NAT where UDP egress works**; the escape hatch for **UDP-blocked** networks is the **HTTPS relay (T2 / P2b)**, which is the right tool anyway (TCP, passes inspecting proxies).
 
 ### T2 — HTTPS relay (store-and-forward fallback)
 
@@ -272,7 +273,7 @@ Each peer advertises the modes it supports; negotiation (§5) picks the first th
 | --- | --- | --- | --- | --- |
 | **LAN direct** | two machines on one network | mDNS/DNS-SD discovery → TCP/QUIC | standard (not re-probed) | nothing |
 | **WebRTC / STUN** | general internet, behind NAT | ICE + DTLS data channel | ✅ STUN round-trip (Google + Cloudflare) | nothing |
-| **WebRTC / TURN** | symmetric NAT, or UDP blocked | TURN relay (UDP 3478 / TLS 443) | partial — STUN worked; TURN-over-443 not run | TURN (self-host coturn, or provider) |
+| **WebRTC / TURN** | symmetric NAT (UDP egress works) | TURN relay over **UDP** (webrtc-ice is UDP-only; no TLS/TCP) | ✅ UDP TURN verified vs. live coturn; TLS/TCP unsupported upstream | TURN (self-host UDP coturn, or provider) |
 | **Self-hosted relay** | teams, full control, off public infra | HTTPS PUT/GET store-and-forward | ✅ HTTPS relay class reachable | a host you run |
 | **ntfy rendezvous** *(default)* | zero-config signaling | pub/sub over HTTP | ✅ publish + read round-trip verified | nothing |
 | **Paste dead-drop** | tiny manual transfers | HTTP PUT to `0x0.st` / `paste.rs` | reachable (GET 200) | nothing |

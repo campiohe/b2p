@@ -1,12 +1,23 @@
 # b2p v2 — P2a design: TURN fallback (+ SCTP stall-guard)
 
 *Sub-phase of P2. Adds TURN relay support to the existing WebRTC transport so
-transfers survive symmetric NAT and UDP-blocked networks, and hardens the
+transfers survive **symmetric NAT** (where UDP egress works), and hardens the
 send path against a stall on a dead peer. No new transport, no negotiation
 engine — those are later P2 sub-phases.*
 
-Status: **Approved for planning** · Companion to `b2p-v2-spec.md` (§4 T1, §5) and
+Status: **Implemented (as-built)** · Companion to `b2p-v2-spec.md` (§4 T1, §5) and
 `docs/superpowers/specs/2026-07-22-b2p-v2-p1-design.md`.
+
+> **As-built correction (verified against a live coturn).** `webrtc-ice` (all
+> published versions, incl. 0.17.2) gathers TURN relay candidates **over UDP
+> only** — `turns:` (TLS) and `?transport=tcp` are commented-out TODOs upstream
+> and silently gather nothing. So the **UDP-blocked escape hatch
+> (TURN-over-TLS-443) is not deliverable** with the Rust WebRTC stack, and
+> `--turn-public` is dropped (its endpoint is also dead). What P2a ships: **UDP
+> TURN for symmetric NAT** — verified end-to-end, including coturn accepting our
+> ephemeral `use-auth-secret` credentials. The correct answer for UDP-blocked
+> networks is the **HTTPS relay (P2b)** (TCP; passes inspecting proxies).
+> Sections below are annotated where the plan changed.
 
 ---
 
@@ -16,13 +27,11 @@ Status: **Approved for planning** · Companion to `b2p-v2-spec.md` (§4 T1, §5)
 
 - TURN relay support in the WebRTC transport: extend the ICE configuration with
   TURN servers (with credentials), so ICE can gather relay candidates.
-- `turn:` (UDP/TCP) and `turns:` (TLS-443) URLs, the latter being the escape
-  hatch for networks that block UDP outright.
+- `turn:` (UDP) URLs only. `turns:`/`?transport=tcp` are **rejected with a clear
+  error** (webrtc-ice can't gather over them). UDP-blocked networks use the HTTPS
+  relay (P2b) instead.
 - CLI flags on both `receive` and `send` to supply a TURN server, with two
   credential modes: ephemeral (coturn `use-auth-secret`) and static long-term.
-- `--turn-public`: an explicit, opt-in convenience flag using a bundled
-  best-effort free relay, so a user behind symmetric NAT can get a relay without
-  running coturn.
 - Send-side SCTP stall guard (the `// TODO(p2)` in `transport/webrtc.rs`).
 
 **Out of P2a** (later P2/P3 sub-phases): the self-hostable relay binary
@@ -47,12 +56,13 @@ Confirmed against `webrtc-0.17.2` / `webrtc-ice-0.17.2`:
   (`SchemeType::Turns`). Note: `turns:` requires `transport=tcp`; `transport=udp`
   is rejected by the URL parser.
 
-**Open runtime unknown (de-risk before finalizing the implementation):** whether
-`webrtc-0.17.2` actually *completes* a TURN-over-TLS allocation against a real
-`turns:443` server. URL parsing is confirmed; the TLS allocation round-trip is
-not. The plan MUST include a live smoke against a real `turns:443` relay
-(`--turn-public` Open Relay, or a self-hosted coturn) before the sub-phase is
-considered done.
+**Resolved (de-risk run against a live coturn).** `webrtc-ice-0.17.2` gathers
+relay candidates **over UDP only**: `agent_gather.rs` handles `ProtoType::Udp &&
+SchemeType::Turn` and drops everything else (`turns:`, `?transport=tcp`) through
+a commented-out TODO. Verified: `turn:host:3478` (UDP) gathers a relay candidate
+and coturn accepts our `use-auth-secret` credential; `turn:…?transport=tcp` and
+`turns:…` both gather nothing. So `--turn` rejects non-UDP URLs, and TURN covers
+symmetric NAT only — not UDP-blocked networks (→ P2b relay).
 
 ## 3. Credential model
 
@@ -72,10 +82,8 @@ through the **normal, already-encrypted ICE candidate exchange** (P1d's sealed
   symmetric NAT can prevent a direct pair): the receiver runs
   `b2p receive --turn … --turn-secret …`, allocates a relay, and offers that
   relay candidate over ICE. The **sender connects zero-config**.
-- **UDP fully blocked:** the blocked peer cannot reach anything over UDP, so it
-  must route out through TURN-over-TLS itself. That peer passes
-  `--turn`/`--turn-public`; it allocates a relay over `turns:443` and offers the
-  candidate; the other peer reaches it zero-config.
+- **UDP fully blocked:** TURN can't help — webrtc-ice has no TCP/TLS relay path.
+  Use the HTTPS relay (P2b), which is TCP and works where UDP is blocked.
 
 This needs **no new signaling frame kind, no pre-connection exchange round, and
 no credential sharing between peers.** A peer with no TURN flags behaves exactly
@@ -120,32 +128,28 @@ the network-restricted side):
 
 | Flag | Meaning |
 | --- | --- |
-| `--turn <URL>` (repeatable) | A `turn:` or `turns:` URL, e.g. `turns:turn.me.com:443?transport=tcp`. |
+| `--turn <URL>` (repeatable) | A `turn:` (UDP) URL, e.g. `turn:turn.me.com:3478`. `turns:`/`?transport=tcp` are rejected. |
 | `--turn-secret <S>` | coturn `use-auth-secret` shared secret; b2p mints ephemeral creds (§3.2). |
 | `--turn-user <U>` / `--turn-pass <P>` | Static long-term creds (§3.3). |
-| `--turn-public` | Use the bundled best-effort free relay; standalone, no other flags needed. |
 
-Validation (clap):
+Validation (clap + `turn::resolve`):
 
 - `--turn` requires exactly one credential mode: `--turn-secret`, **or** both
-  `--turn-user` and `--turn-pass`. The one credential set applies to **all**
-  `--turn` URLs given (the expected case is one coturn exposed on several
-  ports/schemes, e.g. `turn:host:3478` and `turns:host:443?transport=tcp`).
-- `--turn-secret`, the `--turn-user`/`--turn-pass` pair, and `--turn-public` are
-  mutually exclusive as credential sources. `--turn-public` needs no `--turn`.
+  `--turn-user` and `--turn-pass`. The one credential set applies to all `--turn`
+  URLs given.
+- `--turn-secret` and the `--turn-user`/`--turn-pass` pair are mutually exclusive.
 - `--turn-user` and `--turn-pass` require each other.
+- Non-UDP URLs (`turns:`, `?transport=tcp`) are rejected at `resolve` with a
+  message pointing at the HTTPS relay for UDP-blocked networks.
 
-## 5. `--turn-public`
+## 5. `--turn-public` — dropped
 
-Expands to a hardcoded set of `RTCIceServer` entries for a known free relay
-(Open Relay / metered.ca: `turn:…:80`, `turn:…:443?transport=tcp`,
-`turns:…:443?transport=tcp`, with its published static credentials). Kept in a
-single constant so it is trivial to update if the endpoint changes.
-
-Documented as **best-effort**: it is a third-party service that is rate-limited
-and may disappear (the same fragility that made `*.trycloudflare.com` a bad
-default — hence opt-in, never automatic). Error/diagnostic copy should say so
-when a `--turn-public` transfer fails.
+Planned as a bundled free relay (Open Relay / metered.ca), but dropped in the
+as-built. metered.ca deprecated the anonymous Open Relay endpoint — it now
+refuses connections (the same `*.trycloudflare.com` fragility, already realized)
+— and even a live free relay's main value is TLS/443, which webrtc-ice can't
+use. TURN is `--turn`-only: a self-hosted UDP coturn, or a provider's UDP
+endpoint.
 
 ## 6. ICE integration
 
@@ -186,13 +190,12 @@ hanging, so the sender fails fast and runs diagnostics.
 
 **Networked smokes (required — transport change; offline tests cannot trigger
 real ICE relay selection):**
-1. A transfer forced onto the relay path (via `--turn-public` or a real coturn),
-   asserting byte-identical delivery and that the winning path is the relay.
+1. UDP TURN de-risk: the env-based `gathers_relay_candidate_via_turn` `#[ignore]`
+   test pointed at a live coturn (`B2P_TURN_URL=turn:127.0.0.1:3478
+   B2P_TURN_SECRET=…`) gathers a `typ relay` candidate — done; also confirmed
+   `turns:`/`?transport=tcp` gather nothing.
 2. SCTP stall guard: kill the receiver mid-send and confirm the sender's `send`
    returns `Err` promptly rather than hanging (mirrors the P1e kill-smoke).
-3. TURN-over-TLS-443 de-risk (§2): confirm a `turns:443` relay yields a relay
-   candidate and completes a transfer, exercising the one unverified runtime
-   path.
 
 ## 9. Rollout
 
@@ -204,6 +207,9 @@ real ICE relay selection):**
 
 ## 10. Open items carried to `todo.md`
 
+- **TURN over TCP/TLS** is blocked upstream (webrtc-ice 0.17.2 is UDP-only);
+  revisit if a newer webrtc-ice implements it. Until then, UDP-blocked networks
+  rely on the HTTPS relay (P2b).
 - Credential advertisement/borrowing so a zero-config peer can use the other
   peer's TURN (§3.1).
 - `b2p doctor` TURN reachability check when `--turn` is supplied.
