@@ -281,7 +281,13 @@ async fn receive_p1_cli(
     .await
     {
         Ok(d) => d,
-        Err(e) => return connect_failed(e, base, tls).await,
+        // Only an establishment (handshake/connect) failure runs the doctor
+        // (design §6) — a transfer-phase error (declined, hash mismatch,
+        // version mismatch) is returned as-is for `main` to print once.
+        Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
+            return connect_failed(e, base, tls).await
+        }
+        Err(e) => return Err(e),
     };
     eprintln!("via WebRTC (STUN)");
     eprintln!("Done: {desc}");
@@ -295,6 +301,18 @@ async fn do_send(
     rendezvous: Option<String>,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
+    // Classify/parse the code BEFORE `archive::prepare`, which can tar a
+    // large folder — an invalid code should fail fast, not after a long tar.
+    enum Dest {
+        Rendezvous(b2p::rvcode::RendezvousCode),
+        Tunnel(Code),
+    }
+    let dest = if b2p::rvcode::is_rendezvous_code(&code) {
+        Dest::Rendezvous(b2p::rvcode::parse(&code).context("invalid code")?)
+    } else {
+        Dest::Tunnel(Code::parse(&code).context("invalid code — paste it exactly as printed")?)
+    };
+
     let source = match &text {
         Some(t) => archive::prepare_text(t),
         None => {
@@ -302,49 +320,72 @@ async fn do_send(
             archive::prepare(&paths)?
         }
     };
-    if b2p::rvcode::is_rendezvous_code(&code) {
-        let rc = b2p::rvcode::parse(&code).context("invalid code")?;
-        let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
-        let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
-            Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-        let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
-        eprintln!("Waiting for the receiver...");
-        let desc = match b2p::session::send_p1(
-            rv,
-            &rc.topic,
-            &rc.secret.0,
-            &source,
-            &stun,
-            CONNECT_TIMEOUT,
-            None,
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => return connect_failed(e, base, tls).await,
-        };
-        eprintln!("via WebRTC (STUN)");
-        eprintln!("Done: {desc}");
-        Ok(())
-    } else {
-        // v1 tunnel code
-        let code = Code::parse(&code).context("invalid code — paste it exactly as printed")?;
-        let bar = match &source {
-            archive::Source::Blob { total_size, .. } => Some(progress::transfer_bar(*total_size)),
-            archive::Source::Text { .. } => None,
-        };
-        eprintln!("Waiting for the receiver to accept...");
-        let desc = send::send(&code, source, bar.clone(), tls).await?;
-        if let Some(b) = bar {
-            b.finish();
+    match dest {
+        Dest::Rendezvous(rc) => {
+            let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
+            let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
+                Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
+            let stun: Vec<String> = STUN_SERVERS.iter().map(|s| s.to_string()).collect();
+            let bar = match &source {
+                archive::Source::Blob { total_size, .. } => {
+                    Some(progress::transfer_bar(*total_size))
+                }
+                archive::Source::Text { .. } => None,
+            };
+            eprintln!("Waiting for the receiver...");
+            let desc = match b2p::session::send_p1(
+                rv,
+                &rc.topic,
+                &rc.secret.0,
+                &source,
+                &stun,
+                CONNECT_TIMEOUT,
+                bar.clone(),
+            )
+            .await
+            {
+                Ok(d) => d,
+                // Only an establishment (handshake/connect) failure runs the
+                // doctor (design §6) — a transfer-phase error is returned
+                // as-is for `main` to print once.
+                Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
+                    return connect_failed(e, base, tls).await
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(b) = bar {
+                b.finish();
+            }
+            eprintln!("via WebRTC (STUN)");
+            eprintln!("Done: {desc}");
+            Ok(())
         }
-        eprintln!("Done: {desc}");
-        Ok(())
+        Dest::Tunnel(code) => {
+            // v1 tunnel code
+            let bar = match &source {
+                archive::Source::Blob { total_size, .. } => {
+                    Some(progress::transfer_bar(*total_size))
+                }
+                archive::Source::Text { .. } => None,
+            };
+            eprintln!("Waiting for the receiver to accept...");
+            let desc = send::send(&code, source, bar.clone(), tls).await?;
+            if let Some(b) = bar {
+                b.finish();
+            }
+            eprintln!("Done: {desc}");
+            Ok(())
+        }
     }
 }
 
-/// Run on a P1 connect failure (design §6): print the error, run the doctor,
-/// and surface both to the user before returning the original error.
+/// Run on a P1 establishment failure (design §6: handshake/connect only —
+/// never a transfer-phase error, see `EstablishError`): print the error, run
+/// the doctor, and surface both to the user.
+///
+/// Prints the full error itself (via `{e:#}`) and returns a short, distinct
+/// error so `main`'s own `error: {e:#}` doesn't repeat the same text —
+/// callers should propagate this return value as-is, not re-wrap `e`.
 ///
 /// `rendezvous_base` is used only to point the doctor's DNS check at the
 /// right host. Note the doctor's rendezvous-*reachability* check is still
@@ -366,7 +407,9 @@ async fn connect_failed(
     })
     .await;
     eprintln!("{report}");
-    Err(e)
+    Err(anyhow::anyhow!(
+        "could not establish a connection (see diagnostics above)"
+    ))
 }
 
 fn parse_target(s: &str) -> anyhow::Result<String> {

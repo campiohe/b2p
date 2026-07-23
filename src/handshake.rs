@@ -66,7 +66,17 @@ pub(crate) async fn handshake_with_timeout(
 ) -> anyhow::Result<SessionKey> {
     tokio::time::timeout(timeout, handshake_inner(rv, topic, password, role))
         .await
-        .context("timed out on the rendezvous — is the other side running?")?
+        .with_context(|| {
+            // The receiver is the one left waiting at a terminal — point it at
+            // the concrete next action. (Not a retry loop in-process: that
+            // would interact badly with the rendezvous code's freshness
+            // window — a documented follow-up.)
+            let base = "timed out on the rendezvous — is the other side running?";
+            match role {
+                Role::Receiver => format!("{base} — re-run `b2p receive` to try again"),
+                Role::Sender => base.to_string(),
+            }
+        })?
 }
 
 /// The full exchange (subscribe + both publishes + both reads), run under a

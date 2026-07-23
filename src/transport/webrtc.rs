@@ -24,6 +24,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -39,6 +40,14 @@ fn other(r: Role) -> Role {
 /// (which holds a `Sender` clone kept alive by `WebRtcChannel`'s own `dc`
 /// handle) — so without an explicit close signal, `rx.recv()` would pend
 /// forever instead of erroring per the `MsgChannel` contract.
+///
+/// `on_close` alone only covers a *clean* `pc.close()` on the remote end.
+/// When a peer dies abruptly (Ctrl-C/crash/network drop), ICE eventually
+/// goes `Failed` (~25-30s after loss) but only deletes candidates — it never
+/// closes the data channel, so `on_close` never fires either. `establish`
+/// also wires `pc.on_peer_connection_state_change` to send `Closed` on this
+/// same channel for `Failed`/`Closed`, so both death modes surface as a
+/// bounded `Err` from `recv()`.
 enum Item {
     Msg(Vec<u8>),
     Closed,
@@ -53,6 +62,12 @@ pub struct WebRtcChannel {
 
 #[async_trait]
 impl MsgChannel for WebRtcChannel {
+    // TODO(p2): a `send` already parked on SCTP's 128 MiB backpressure
+    // semaphore (webrtc-rs's association) with a dead-but-not-yet-detected
+    // peer won't unblock on the close signal below — it's waiting inside
+    // `dc.send`, not on `rx`. Follow-up: guard `send` with a
+    // `tokio::select!` against a close notification (e.g. a `Notify` set by
+    // the same `on_close`/`on_peer_connection_state_change` handlers).
     async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
         self.dc
             .send(&Bytes::copy_from_slice(msg))
@@ -150,17 +165,18 @@ fn wire_local_ice(
     }));
 }
 
-/// Bridge the data channel's on_message/on_close to an mpsc the MsgChannel
-/// drains, and fire `open` when the channel opens.
-fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>) -> mpsc::Receiver<Item> {
-    let (tx, rx) = mpsc::channel::<Item>(64);
-    let close_tx = tx.clone();
+/// Bridge the data channel's on_message/on_close to `tx` (an mpsc the
+/// MsgChannel drains — shared with `establish`'s peer-connection-state-change
+/// handler, see `Item`), and fire `open` when the channel opens.
+fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>, tx: mpsc::Sender<Item>) {
+    let msg_tx = tx.clone();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
-        let tx = tx.clone();
+        let msg_tx = msg_tx.clone();
         Box::pin(async move {
-            let _ = tx.send(Item::Msg(msg.data.to_vec())).await;
+            let _ = msg_tx.send(Item::Msg(msg.data.to_vec())).await;
         })
     }));
+    let close_tx = tx.clone();
     dc.on_close(Box::new(move || {
         let close_tx = close_tx.clone();
         Box::pin(async move {
@@ -174,7 +190,6 @@ fn wire_channel(dc: &Arc<RTCDataChannel>, open: Arc<Notify>) -> mpsc::Receiver<I
             open2.notify_one();
         })
     }));
-    rx
 }
 
 /// Aborts the wrapped task when dropped — guarantees the signaling pump task
@@ -204,24 +219,56 @@ async fn establish(
     wire_local_ice(&pc, rv.clone(), topic.to_string(), sig_key, role);
 
     let open = Arc::new(Notify::new());
+    // Shared with `wire_channel`'s on_message/on_close (per-data-channel) and
+    // the peer-connection-state-change handler below (whole-pc-level) — both
+    // funnel into the one mpsc `WebRtcChannel::recv` drains, so either a
+    // clean data-channel close or an abrupt ICE `Failed`/pc `Closed` surfaces
+    // as a bounded `Err` there instead of pending forever.
+    let (tx, rx) = mpsc::channel::<Item>(64);
+
+    // Abrupt peer death (Ctrl-C/crash/network drop, i.e. no clean
+    // `pc.close()`): ICE goes `Failed` ~25-30s after loss but only deletes
+    // candidates — it never closes the data channel, so `on_close` alone
+    // would never fire. Do NOT signal on `Disconnected`: per the W3C/webrtc-rs
+    // state machine it can still recover (transports reconnecting), unlike
+    // `Failed`/`Closed` which are terminal. A duplicate `Item::Closed` (this
+    // handler racing `on_close`) is harmless — `recv` takes whichever arrives
+    // first and returns Err either way.
+    {
+        let tx = tx.clone();
+        pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if matches!(
+                    s,
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+                ) {
+                    let _ = tx.send(Item::Closed).await;
+                }
+            })
+        }));
+    }
+
     // channel handle differs by role: receiver creates it, sender receives it.
-    let (chan_tx, mut chan_rx) = mpsc::channel::<(Arc<RTCDataChannel>, mpsc::Receiver<Item>)>(1);
+    let (chan_tx, mut chan_rx) = mpsc::channel::<Arc<RTCDataChannel>>(1);
 
     match role {
         Role::Receiver => {
             let dc = pc.create_data_channel("b2p", None).await?;
-            let rx = wire_channel(&dc, open.clone());
-            chan_tx.send((dc, rx)).await.ok();
+            wire_channel(&dc, open.clone(), tx.clone());
+            chan_tx.send(dc).await.ok();
         }
         Role::Sender => {
             let open2 = open.clone();
             let chan_tx2 = chan_tx.clone();
+            let tx2 = tx.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let open2 = open2.clone();
                 let chan_tx2 = chan_tx2.clone();
+                let tx2 = tx2.clone();
                 Box::pin(async move {
-                    let rx = wire_channel(&dc, open2.clone());
-                    let _ = chan_tx2.send((dc, rx)).await;
+                    wire_channel(&dc, open2.clone(), tx2.clone());
+                    let _ = chan_tx2.send(dc).await;
                 })
             }));
         }
@@ -303,7 +350,7 @@ async fn establish(
     // Wait for the data channel to open. No inner timeout here — `connect`
     // bounds this whole function (subscribe/publish/wait) with one deadline.
     open.notified().await;
-    let (dc, rx) = chan_rx
+    let dc = chan_rx
         .recv()
         .await
         .context("data channel opened but handle was lost")?;

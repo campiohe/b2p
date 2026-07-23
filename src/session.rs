@@ -15,6 +15,30 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Marks an error as having occurred during *establishment* (handshake or
+/// WebRTC connect) rather than during the transfer itself (design §6 scopes
+/// `b2p doctor` to establishment failures — not to a declined transfer, a
+/// hash mismatch, or a version mismatch, which are transfer-phase outcomes
+/// no amount of network diagnosis explains). `main.rs`'s call sites use
+/// `downcast_ref::<EstablishError>` to decide whether to run the doctor.
+#[derive(Debug)]
+pub struct EstablishError(pub anyhow::Error);
+impl std::fmt::Display for EstablishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` (not `{}`): anyhow's own alternate-Display chain-walking only
+        // triggers for a `anyhow::Error` value itself (it walks the boxed
+        // error's `std::error::Error::source()` chain, which a bare wrapper
+        // struct like this doesn't have). Forcing alternate here bakes the
+        // full "context: cause: cause" chain into this Display's own output,
+        // so it survives being re-boxed into a new `anyhow::Error` by the
+        // `?`/`From` conversion below — otherwise the cause chain (e.g. the
+        // underlying reqwest/WebRTC error) would silently disappear from
+        // whatever prints `e` afterwards, regardless of `{}` vs `{:#}` there.
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for EstablishError {}
+
 // 8 params matches the P1e interface contract exactly (Task 2's CLI calls
 // this directly); a params struct would just move the same fields elsewhere.
 #[allow(clippy::too_many_arguments)]
@@ -28,8 +52,12 @@ pub async fn receive_p1(
     timeout: Duration,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
-    let key = handshake(rv.as_ref(), topic, secret, Role::Receiver).await?;
-    let mut ch = connect(rv.clone(), topic, &key, Role::Receiver, stun, timeout).await?;
+    let key = handshake(rv.as_ref(), topic, secret, Role::Receiver)
+        .await
+        .map_err(EstablishError)?;
+    let mut ch = connect(rv.clone(), topic, &key, Role::Receiver, stun, timeout)
+        .await
+        .map_err(EstablishError)?;
     let desc = recv_into(&mut ch, &key, out_dir, accept, progress).await?;
     // Graceful close: keep the connection alive until the sender closes it,
     // which confirms the sender received our final CommitAck. Without this the
@@ -50,8 +78,12 @@ pub async fn send_p1(
     timeout: Duration,
     progress: Option<indicatif::ProgressBar>,
 ) -> anyhow::Result<String> {
-    let key = handshake(rv.as_ref(), topic, secret, Role::Sender).await?;
-    let mut ch = connect(rv.clone(), topic, &key, Role::Sender, stun, timeout).await?;
+    let key = handshake(rv.as_ref(), topic, secret, Role::Sender)
+        .await
+        .map_err(EstablishError)?;
+    let mut ch = connect(rv.clone(), topic, &key, Role::Sender, stun, timeout)
+        .await
+        .map_err(EstablishError)?;
     send_source(&mut ch, &key, source, progress).await
 }
 
