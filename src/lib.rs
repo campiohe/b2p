@@ -3,6 +3,7 @@ pub mod cloudflared_pins;
 pub mod code;
 pub mod crypto;
 pub mod doctor;
+pub mod doh;
 pub mod handshake;
 pub mod http;
 pub mod pake;

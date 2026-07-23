@@ -178,6 +178,37 @@ fn failure_summary(name: &str, host: &str, ran_doctor: bool) -> String {
     }
 }
 
+/// Build the sender's HTTP client on top of the OS-trust client, additionally
+/// resolving a remote tunnel host over DoH so a DNS-layer filter (e.g. Cisco
+/// Umbrella sinkholing `*.trycloudflare.com`) can't redirect us to a block
+/// page. Falls back to system DNS if DoH is unavailable. Direct/LAN codes (IP
+/// literal or localhost) skip DoH entirely — there is nothing to un-filter.
+async fn build_client(
+    url: &url::Url,
+    tls: &crate::http::TlsOpts,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = crate::http::builder(tls)?;
+    if let Some(host) = url.host_str() {
+        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+        if !is_ip && host != "localhost" {
+            match crate::doh::resolve(host, tls).await {
+                Ok(ips) if !ips.is_empty() => {
+                    let port = url.port_or_known_default().unwrap_or(443);
+                    let addrs: Vec<std::net::SocketAddr> = ips
+                        .iter()
+                        .map(|ip| std::net::SocketAddr::new(*ip, port))
+                        .collect();
+                    eprintln!("Resolved {host} via DoH ({} address(es))", addrs.len());
+                    builder = builder.resolve_to_addrs(host, &addrs);
+                }
+                Ok(_) => eprintln!("DoH returned no records for {host}; using system DNS"),
+                Err(e) => eprintln!("DoH lookup failed ({e:#}); using system DNS"),
+            }
+        }
+    }
+    Ok(builder.build()?)
+}
+
 pub async fn send(
     code: &Code,
     source: Source,
@@ -187,7 +218,7 @@ pub async fn send(
     let key = code.secret.data_key();
     let token = code.secret.auth_token();
     let base = code.base_url.as_str().trim_end_matches('/').to_string();
-    let client = crate::http::client(tls)?;
+    let client = build_client(&code.base_url, tls).await?;
 
     let manifest = build_manifest(&source)?;
     let manifest_body = seal_json(&key, Domain::Manifest, b"", &manifest);

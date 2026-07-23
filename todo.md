@@ -74,6 +74,22 @@ spec phase they belong to. See `b2p-v2-spec.md` and
       persistence for this path.
 - [ ] **Orphaned `.b2p-partial` staging cleanup** for abandoned P1 transfers.
 
+## Out-of-core transport plugins (open interface — not shipped in the core binary)
+
+Per spec §11, these are **not maintained in the core binary** but the open
+`Transport`/`Rendezvous` interfaces (Appendix A) are meant to accept them as
+out-of-tree plugins. Captured here so the door stays explicitly open rather than
+foreclosed. Each changes b2p's threat/abuse profile, so gate behind an explicit
+opt-in flag and ship outside the default build.
+
+- [ ] **Traffic obfuscation / mimicry** transport — shape traffic to look like an
+      allowed protocol on hostile networks.
+- [ ] **Domain fronting** transport — front through a permitted CDN hostname.
+- [ ] **SNI spoofing / ECH** transport — decouple the visible SNI from the real
+      destination.
+- [ ] **Blocklist-evasion domain cycling** for the rendezvous — rotate rendezvous
+      hostnames when one is blocked.
+
 ## Housekeeping
 
 - [ ] `b2p://` power-user URL code form is parseable but no command emits one

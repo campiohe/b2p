@@ -239,10 +239,11 @@ P0 is independently shippable and fixes the reported bug immediately; each later
 
 v2 is **open and multi-mode by design** (Appendix A): transports and rendezvous are plugins, so b2p adapts to many contexts — a LAN, the open internet, a NAT'd home link, self-hosted infrastructure, or fully offline. No single principle like *"always cooperate with the network"* is imposed on every mode, because the right behavior genuinely differs by context and different deployments run on very different networks.
 
-What the **core project** ships is scoped, though:
+What the **core project** maintains is scoped, though — this bounds what the core *binary* ships and supports, not what the open architecture permits:
 
-- **Ships:** transports that use *permitted connectivity* (WebRTC/STUN/TURN, LAN, mainstream HTTPS) or *the operator's own infrastructure* (self-hosted relay/rendezvous/TURN, cloud/git backends under the user's own credentials), always E2E-encrypted, and trusting the OS trust store so inspecting proxies pass b2p rather than break it.
-- **Does not ship:** transports whose function depends on traffic obfuscation/mimicry, domain fronting, SNI spoofing, blocklist-evasion domain cycling, or DoH used to override a network's DNS policy.
+- **Ships in core:** transports that use *permitted connectivity* (WebRTC/STUN/TURN, LAN, mainstream HTTPS) or *the operator's own infrastructure* (self-hosted relay/rendezvous/TURN, cloud/git backends under the user's own credentials) — always E2E-encrypted, and trusting the OS trust store so inspecting proxies pass b2p rather than break it.
+- **Not maintained in core, but open to plugins:** transports whose function depends on traffic obfuscation/mimicry, domain fronting, SNI spoofing, or blocklist-evasion domain cycling. These are not rejected on principle — the open Transport/Rendezvous interfaces (Appendix A) let anyone add them as out-of-tree plugins. The core *binary* simply doesn't ship or maintain them, to keep its threat and abuse profile predictable.
+- **Honest DNS resolution ships:** resolving a tunnel host over DoH against a *truthful* public resolver when the local resolver is lying (e.g. sinkholing `*.trycloudflare.com` to a block page) is honest, not evasion — you ask a correct resolver by name, spoofing no one. It ships on the `--tunnel` path (the default WebRTC transport never resolves a tunnel host, so DoH does not apply there).
 
 ---
 
