@@ -475,6 +475,9 @@ async fn receive_relay_cli(
     );
     eprintln!("\nWaiting for the sender... (Ctrl-C to abort)");
 
+    // A 409 right after re-arming usually means the DO hasn't reaped our
+    // previous socket yet — retry briefly before treating it as fatal.
+    let mut busy_retries = 0u32;
     loop {
         let out_for_accept = out.clone();
         let accept =
@@ -507,6 +510,18 @@ async fn receive_relay_cli(
             }
             Err(e) if e.downcast_ref::<b2p::handshake::CodeMismatch>().is_some() => {
                 eprintln!("a sender connected with a non-matching code — still waiting...");
+                busy_retries = 0;
+            }
+            Err(e)
+                if busy_retries < 5
+                    && e.downcast_ref::<b2p::session::EstablishError>()
+                        .is_some_and(|ee| {
+                            ee.0.downcast_ref::<b2p::transport::relay::RoomBusy>()
+                                .is_some()
+                        }) =>
+            {
+                busy_retries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
             Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
                 return connect_failed_relay(e, &relay, tls).await;

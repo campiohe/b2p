@@ -65,6 +65,11 @@ pub fn pack_frames(pending: &mut VecDeque<Vec<u8>>) -> Option<Vec<u8>> {
     (!buf.is_empty()).then_some(buf)
 }
 
+/// Largest logical frame we will reassemble. Generous (a manifest for a
+/// ~1M-file folder fits), but bounds what a hostile room peer can make us
+/// buffer by streaming continuation pieces forever.
+pub const MAX_LOGICAL_FRAME: usize = 64 * 1024 * 1024;
+
 /// Reassembles logical frames from WS payloads, buffering continuations.
 #[derive(Default)]
 pub struct Debatcher {
@@ -83,6 +88,9 @@ impl Debatcher {
             p = &p[4..];
             if p.len() < len {
                 bail!("truncated sub-frame body");
+            }
+            if self.partial.len() + len > MAX_LOGICAL_FRAME {
+                bail!("logical frame exceeds {MAX_LOGICAL_FRAME} bytes");
             }
             self.partial.extend_from_slice(&p[..len]);
             p = &p[len..];
@@ -194,6 +202,21 @@ async fn dial(
     Ok(ws)
 }
 
+/// The relay answered 409: the room already has a socket in our role. Usually
+/// a just-closed predecessor the DO hasn't reaped yet (receiver re-arm) or a
+/// genuine code collision — callers may retry briefly before giving up.
+#[derive(Debug)]
+pub struct RoomBusy;
+impl std::fmt::Display for RoomBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another connection is already using this code's room — retry shortly or get a fresh code"
+        )
+    }
+}
+impl std::error::Error for RoomBusy {}
+
 /// Turn tungstenite's HTTP-rejection errors into actionable messages.
 fn relay_dial_help(e: tokio_tungstenite::tungstenite::Error, base: &str) -> anyhow::Error {
     use tokio_tungstenite::tungstenite::Error::Http;
@@ -202,9 +225,7 @@ fn relay_dial_help(e: tokio_tungstenite::tungstenite::Error, base: &str) -> anyh
             401 => anyhow!(
                 "the relay {base} requires a token — set it with `b2p relay set {base} --token <T>` or B2P_RELAY_TOKEN"
             ),
-            409 => anyhow!(
-                "another transfer is already using this code's room on {base} — get a fresh code and try again"
-            ),
+            409 => anyhow::Error::new(RoomBusy).context(format!("relay {base} refused the join")),
             s => anyhow!("the relay {base} refused the connection (HTTP {s})"),
         };
     }
@@ -308,10 +329,18 @@ impl MsgChannel for RelayChannel {
     async fn send(&mut self, msg: &[u8]) -> anyhow::Result<()> {
         // Window check. watch::changed() is version-counted, so an ack that
         // lands between borrow() and changed() still wakes us — no lost-
-        // wakeup race (the P2a close-latch lesson).
+        // wakeup race (the P2a close-latch lesson). A frame larger than the
+        // window itself (e.g. a manifest for a folder with 100k+ files) is
+        // let through once the pipe is as drained as it can get: acks are
+        // threshold-batched every ACK_EVERY bytes, so up to ACK_EVERY-1
+        // consumed bytes are never acknowledged — `unacked < ACK_EVERY` is
+        // the true "drained" floor. Without this escape an oversized frame
+        // would stall forever; with it, relay buffering stays bounded by
+        // max(WINDOW, frame size) + ACK_EVERY.
         loop {
             let acked = *self.acked_rx.borrow();
-            if self.sent.saturating_sub(acked) + msg.len() as u64 <= WINDOW {
+            let unacked = self.sent.saturating_sub(acked);
+            if unacked + msg.len() as u64 <= WINDOW || unacked < ACK_EVERY {
                 break;
             }
             if self.acked_rx.changed().await.is_err() {
@@ -479,6 +508,69 @@ mod tests {
         bad.extend_from_slice(&[9, 9]);
         assert!(Debatcher::default().push(&bad).is_err());
         drop(d);
+    }
+
+    #[test]
+    fn debatcher_caps_runaway_partial() {
+        // A hostile peer streaming endless continuation pieces must hit the
+        // cap instead of growing receiver memory without bound.
+        let mut d = Debatcher::default();
+        let piece = vec![0u8; 1024 * 1024];
+        let mut payload = ((piece.len() as u32) | CONT).to_le_bytes().to_vec();
+        payload.extend_from_slice(&piece);
+        let mut result = Ok(());
+        for _ in 0..=(MAX_LOGICAL_FRAME / piece.len()) {
+            if let Err(e) = d.push(&payload) {
+                result = Err(e);
+                break;
+            }
+        }
+        assert!(result.is_err(), "runaway partial must be rejected");
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_exceeding_window_round_trips() {
+        // A logical frame larger than the 8 MiB send window (e.g. a manifest
+        // for a 100k-file folder) must go through once the pipe drains — not
+        // stall forever.
+        let relay = crate::transport::mock::start().await;
+        let tls = TlsOpts::default();
+        let (r, s) = tokio::join!(
+            connect(
+                &relay.url,
+                "roomBig",
+                Role::Receiver,
+                None,
+                &tls,
+                Duration::from_secs(10)
+            ),
+            connect(
+                &relay.url,
+                "roomBig",
+                Role::Sender,
+                None,
+                &tls,
+                Duration::from_secs(10)
+            )
+        );
+        let (mut r, mut s) = (r.unwrap(), s.unwrap());
+        let big = vec![3u8; 9 * 1024 * 1024];
+        let send_all = async {
+            s.send(b"warmup").await.unwrap();
+            s.send(&big).await.unwrap();
+            s.send(b"after").await.unwrap();
+            s
+        };
+        let send_all = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(send_all, async {
+                assert_eq!(r.recv().await.unwrap(), b"warmup");
+                assert_eq!(r.recv().await.unwrap().len(), big.len());
+                assert_eq!(r.recv().await.unwrap(), b"after");
+                r
+            })
+        })
+        .await;
+        assert!(send_all.is_ok(), "oversized frame must not stall");
     }
 
     #[test]
