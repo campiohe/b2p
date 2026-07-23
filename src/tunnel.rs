@@ -38,12 +38,16 @@ pub(crate) fn parse_tunnel_url(line: &str) -> Option<Url> {
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '|')
         .unwrap_or(rest.len());
-    let candidate = &rest[..end];
-    if candidate.contains(".trycloudflare.com") {
-        candidate.parse().ok()
-    } else {
-        None
-    }
+    let url: Url = rest[..end].parse().ok()?;
+    // A real quick tunnel is a *generated subdomain* of trycloudflare.com with an
+    // empty path. cloudflared's *error* output mentions `api.trycloudflare.com/tunnel`
+    // (the registration endpoint) — which must NOT be accepted, or we'd print a
+    // dead code and wait forever (e.g. on a network that DNS-filters the domain).
+    let host = url.host_str()?;
+    let is_quick_tunnel = host.ends_with(".trycloudflare.com")
+        && host != "api.trycloudflare.com"
+        && matches!(url.path(), "" | "/");
+    is_quick_tunnel.then_some(url)
 }
 
 pub(crate) fn platform_key() -> Option<&'static str> {
@@ -152,22 +156,40 @@ pub async fn start_cloudflared(
     let stderr = child.stderr.take().context("no stderr from cloudflared")?;
     let mut lines = BufReader::new(stderr).lines();
 
-    let url = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // Watch cloudflared's stderr for either the tunnel banner or its failure
+    // line, so a DNS-filtered / blocked network fails fast with cloudflared's
+    // own reason instead of running out the 30s clock (and never mis-parsing an
+    // error line into a dead URL — see `parse_tunnel_url`).
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(url) = parse_tunnel_url(&line) {
-                return Some(url);
+                return Some(Ok(url));
+            }
+            if line.contains("failed to request quick Tunnel") {
+                return Some(Err(line.trim().to_string()));
             }
         }
         None
     })
-    .await
-    .ok()
-    .flatten()
-    .context(
-        "tunnel did not come up within 30s — this network may block cloudflared \
-         (run `b2p doctor` to check); try --direct on a LAN, or run the receiver \
-         on a less restricted network",
-    )?;
+    .await;
+
+    let url = match outcome {
+        Ok(Some(Ok(url))) => url,
+        Ok(Some(Err(reason))) => anyhow::bail!(
+            "cloudflared could not create the quick tunnel: {reason} — this network may be \
+             DNS-filtering trycloudflare.com (run `b2p doctor`); try --direct on a LAN, or \
+             run the receiver on a less restricted network"
+        ),
+        Ok(None) => anyhow::bail!(
+            "cloudflared exited before announcing a tunnel URL (run `b2p doctor`); \
+             try --direct on a LAN, or run the receiver on a less restricted network"
+        ),
+        Err(_) => anyhow::bail!(
+            "tunnel did not come up within 30s — this network may block cloudflared \
+             (run `b2p doctor` to check); try --direct on a LAN, or run the receiver \
+             on a less restricted network"
+        ),
+    };
 
     Ok(TunnelHandle {
         url,
@@ -189,7 +211,19 @@ mod tests {
             "https://tall-lion-radio-carpet.trycloudflare.com/"
         );
         assert!(parse_tunnel_url("no url here").is_none());
-        assert!(parse_tunnel_url("https://api.trycloudflare.com is not a tunnel").is_some());
+    }
+
+    #[test]
+    fn rejects_cloudflared_error_line_and_api_endpoint() {
+        // The failure line cloudflared prints on a DNS-filtered network must NOT
+        // parse into a (dead) tunnel URL — that was the bug: a printed code that
+        // points at the registration API, and a receiver that waits forever.
+        let err = r#"failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel": remote error: tls: handshake failure"#;
+        assert!(parse_tunnel_url(err).is_none());
+        // the api endpoint and any path are rejected; only generated subdomains pass
+        assert!(parse_tunnel_url("https://api.trycloudflare.com").is_none());
+        assert!(parse_tunnel_url("https://foo.trycloudflare.com/path").is_none());
+        assert!(parse_tunnel_url("https://foo.trycloudflare.com").is_some());
     }
 
     #[test]
