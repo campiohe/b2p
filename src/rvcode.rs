@@ -22,6 +22,9 @@ enum Spelling {
 pub struct RendezvousCode {
     pub topic: String,
     pub secret: PakeSecret,
+    /// Relay host embedded in the long spelling (`b2p://<host>/<topic>#…`),
+    /// so a sender with no local relay configuration knows where to meet.
+    pub relay_host: Option<String>,
     spelling: Spelling,
 }
 
@@ -53,9 +56,22 @@ pub fn is_rendezvous_code(s: &str) -> bool {
 pub fn parse(s: &str) -> anyhow::Result<RendezvousCode> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("b2p://") {
-        let (topic, secret_b58) = rest
+        let (addr, secret_b58) = rest
             .split_once('#')
-            .context("b2p code must look like b2p://<topic>#<secret>")?;
+            .context("b2p code must look like b2p://[host/]<topic>#<secret>")?;
+        let (relay_host, topic) = match addr.split_once('/') {
+            Some((host, topic)) => {
+                if host.is_empty()
+                    || !host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || ".-:".contains(c))
+                {
+                    bail!("b2p code relay host contains invalid characters");
+                }
+                (Some(host.to_string()), topic)
+            }
+            None => (None, addr),
+        };
         if topic.is_empty() {
             bail!("b2p code has an empty topic");
         }
@@ -68,12 +84,16 @@ pub fn parse(s: &str) -> anyhow::Result<RendezvousCode> {
         let secret = bs58::decode(secret_b58)
             .into_vec()
             .context("b2p code secret is not valid base58")?;
-        if secret.len() != 16 {
-            bail!("b2p code secret must be 16 bytes (base58)");
+        if secret.len() != 16 && secret.len() != 3 {
+            bail!(
+                "b2p code secret must be 16 bytes (or 3 for a human code) — got {}",
+                secret.len()
+            );
         }
         return Ok(RendezvousCode {
             topic: topic.to_string(),
             secret: PakeSecret(secret),
+            relay_host,
             spelling: Spelling::Url,
         });
     }
@@ -94,6 +114,7 @@ pub fn parse(s: &str) -> anyhow::Result<RendezvousCode> {
     Ok(RendezvousCode {
         topic: topic_from_channel(e[0]),
         secret: PakeSecret(e),
+        relay_host: None,
         spelling: Spelling::Human,
     })
 }
@@ -105,6 +126,7 @@ impl RendezvousCode {
         RendezvousCode {
             topic: topic_from_channel(e[0]),
             secret: PakeSecret(e.to_vec()),
+            relay_host: None,
             spelling: Spelling::Human,
         }
     }
@@ -117,8 +139,20 @@ impl RendezvousCode {
         RendezvousCode {
             topic: bs58::encode(&topic).into_string(),
             secret: PakeSecret(secret.to_vec()),
+            relay_host: None,
             spelling: Spelling::Url,
         }
+    }
+
+    /// This code's topic+secret as a pasteable URL, optionally naming the
+    /// relay so an unconfigured sender knows where to meet.
+    pub fn url_spelling(&self, relay_host: Option<&str>) -> String {
+        let host = relay_host.map(|h| format!("{h}/")).unwrap_or_default();
+        format!(
+            "b2p://{host}{}#{}",
+            self.topic,
+            bs58::encode(&self.secret.0).into_string()
+        )
     }
 }
 
@@ -136,9 +170,14 @@ impl std::fmt::Display for RendezvousCode {
                 )
             }
             Spelling::Url => {
+                let host = self
+                    .relay_host
+                    .as_deref()
+                    .map(|h| format!("{h}/"))
+                    .unwrap_or_default();
                 write!(
                     f,
-                    "b2p://{}#{}",
+                    "b2p://{host}{}#{}",
                     self.topic,
                     bs58::encode(&self.secret.0).into_string()
                 )
@@ -247,6 +286,47 @@ mod tests {
         let reparsed = parse(&c.to_string()).unwrap();
         assert_eq!(reparsed.topic, c.topic);
         assert_eq!(reparsed.secret.0, c.secret.0);
+    }
+
+    #[test]
+    fn url_with_host_round_trips() {
+        let human = RendezvousCode::generate_human();
+        let s = human.url_spelling(Some("my-relay.example.workers.dev"));
+        assert!(s.starts_with("b2p://my-relay.example.workers.dev/"));
+        let parsed = parse(&s).unwrap();
+        assert_eq!(
+            parsed.relay_host.as_deref(),
+            Some("my-relay.example.workers.dev")
+        );
+        assert_eq!(parsed.topic, human.topic);
+        assert_eq!(parsed.secret.0, human.secret.0); // 3-byte secret survives
+        assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn url_without_host_still_parses() {
+        let gen = RendezvousCode::generate_url();
+        let parsed = parse(&gen.to_string()).unwrap();
+        assert!(parsed.relay_host.is_none());
+        assert_eq!(parsed.secret.0.len(), 16);
+    }
+
+    #[test]
+    fn url_spelling_without_host_matches_display() {
+        let gen = RendezvousCode::generate_url();
+        assert_eq!(gen.url_spelling(None), gen.to_string());
+    }
+
+    #[test]
+    fn bad_hosts_and_secret_lengths_are_rejected() {
+        let ok = RendezvousCode::generate_url().to_string();
+        let rest = ok.strip_prefix("b2p://").unwrap();
+        assert!(parse(&format!("b2p://evil host/{rest}")).is_err()); // space
+        assert!(parse(&format!("b2p://a@b/{rest}")).is_err()); // '@'
+                                                               // 5-byte secret: neither 3 nor 16
+        let topic = bs58::encode([1u8; 16]).into_string();
+        let sec5 = bs58::encode([2u8; 5]).into_string();
+        assert!(parse(&format!("b2p://{topic}#{sec5}")).is_err());
     }
 
     #[test]
