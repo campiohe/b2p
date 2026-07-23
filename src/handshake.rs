@@ -63,13 +63,27 @@ pub(crate) async fn handshake_with_timeout(
     role: Role,
     timeout: Duration,
 ) -> anyhow::Result<SessionKey> {
+    tokio::time::timeout(timeout, handshake_inner(rv, topic, password, role))
+        .await
+        .context("timed out on the rendezvous — is the other side running?")?
+}
+
+/// The full exchange (subscribe + both publishes + both reads), run under a
+/// single deadline by `handshake_with_timeout` so a rendezvous that accepts
+/// the connection but never responds can't hang any one step for minutes.
+async fn handshake_inner(
+    rv: &dyn Rendezvous,
+    topic: &str,
+    password: &[u8],
+    role: Role,
+) -> anyhow::Result<SessionKey> {
     let mut stream = rv.subscribe(topic).await?;
 
     // 1. exchange SPAKE2 messages
     let (pake, my_msg) = Pake::start(&PakeSecret(password.to_vec()), topic);
     rv.publish(topic, &encode_frame(KIND_PAKE, role, &my_msg))
         .await?;
-    let peer_msg = wait_for(&mut stream, KIND_PAKE, role_byte(other(role)), timeout).await?;
+    let peer_msg = wait_for(&mut stream, KIND_PAKE, role_byte(other(role))).await?;
     let key = pake.finish(&peer_msg)?;
 
     // 2. exchange + verify key confirmation before trusting the key
@@ -78,34 +92,32 @@ pub(crate) async fn handshake_with_timeout(
         &encode_frame(KIND_CONFIRM, role, &confirmation(&key, role)),
     )
     .await?;
-    let peer_conf = wait_for(&mut stream, KIND_CONFIRM, role_byte(other(role)), timeout).await?;
+    let peer_conf = wait_for(&mut stream, KIND_CONFIRM, role_byte(other(role))).await?;
     if !verify_confirmation(&key, other(role), &peer_conf) {
-        anyhow::bail!("the code didn't match on both sides — double-check it and try again");
+        anyhow::bail!(
+            "the code didn't match — double-check it, or another transfer may be using the \
+             same channel; try a fresh code"
+        );
     }
     Ok(key)
 }
 
 /// Read frames until one matches (kind, role), skipping our own echoes and
-/// unrelated frames, bounded by `timeout`.
+/// unrelated frames. Unbounded on its own — the outer `handshake_with_timeout`
+/// deadline cancels this when a peer never shows up.
 async fn wait_for(
     stream: &mut BoxStream<'static, Vec<u8>>,
     want_kind: u8,
     want_role: u8,
-    timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
-    let fut = async {
-        while let Some(frame) = stream.next().await {
-            if let Some((k, r, payload)) = decode_frame(&frame) {
-                if k == want_kind && r == want_role {
-                    return Ok(payload.to_vec());
-                }
+    while let Some(frame) = stream.next().await {
+        if let Some((k, r, payload)) = decode_frame(&frame) {
+            if k == want_kind && r == want_role {
+                return Ok(payload.to_vec());
             }
         }
-        anyhow::bail!("rendezvous stream ended before the peer responded")
-    };
-    tokio::time::timeout(timeout, fut)
-        .await
-        .context("timed out waiting for the peer on the rendezvous — is the other side running?")?
+    }
+    anyhow::bail!("rendezvous stream ended before the peer responded")
 }
 
 #[cfg(test)]
@@ -144,6 +156,8 @@ mod tests {
         }
         async fn subscribe(&self, topic: &str) -> anyhow::Result<BoxStream<'static, Vec<u8>>> {
             let topic = topic.to_string();
+            // subscribe before snapshot so a concurrent publish duplicates rather than drops
+            let rx = self.tx.subscribe();
             let history: Vec<Vec<u8>> = self
                 .log
                 .lock()
@@ -152,7 +166,6 @@ mod tests {
                 .filter(|(t, _)| *t == topic)
                 .map(|(_, f)| f.clone())
                 .collect();
-            let rx = self.tx.subscribe();
             let live =
                 futures::stream::unfold((rx, topic.clone()), move |(mut rx, topic)| async move {
                     loop {
@@ -216,6 +229,38 @@ mod tests {
             &[1u8, 2, 3],
             Role::Receiver,
             std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    /// Rendezvous double whose subscribe stream is already ended — drives
+    /// the "stream ended before the peer responded" bail! path in `wait_for`,
+    /// distinct from the deadline-elapsed path above.
+    struct DeadRendezvous;
+    #[async_trait]
+    impl Rendezvous for DeadRendezvous {
+        async fn publish(&self, _t: &str, _f: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn subscribe(&self, _t: &str) -> anyhow::Result<BoxStream<'static, Vec<u8>>> {
+            Ok(futures::stream::empty().boxed())
+        }
+        async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_when_stream_ends_before_peer() {
+        let rv = DeadRendezvous;
+        // generous timeout so the failure is the stream ending, not the deadline
+        let r = handshake_with_timeout(
+            &rv,
+            "t",
+            &[1u8, 2, 3],
+            Role::Receiver,
+            std::time::Duration::from_secs(5),
         )
         .await;
         assert!(r.is_err());

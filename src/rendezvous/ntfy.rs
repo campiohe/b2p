@@ -11,9 +11,12 @@ use futures::stream::{BoxStream, StreamExt};
 use tokio::io::AsyncBufReadExt;
 use tokio_util::io::StreamReader;
 
-/// How far back the subscribe stream pulls cached frames. Covers the case
-/// where one peer publishes its PAKE message before the other subscribes.
-const SINCE_WINDOW: &str = "10m";
+/// How far back the subscribe stream pulls cached frames. Only needs to
+/// cover a peer frame published just before this side subscribed — a live
+/// peer never waits longer than the ~120s handshake step budget. Keeping
+/// this short shrinks the stale-frame collision cross-section on
+/// channel-shared topics (multiple transfers reusing the same topic).
+const SINCE_WINDOW: &str = "3m";
 
 pub struct NtfyRendezvous {
     base: String,
