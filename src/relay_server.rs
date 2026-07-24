@@ -27,8 +27,22 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 const MAX_HEAD: usize = 8 * 1024;
-/// Parity with Cloudflare Workers' 1 MiB WS message limit.
+/// Parity with Cloudflare Workers' 1 MiB WS message limit. Applied as both
+/// the message and the frame cap so a single frame can't buffer 16 MiB
+/// (tungstenite's default frame size) before the message check fires.
 const MAX_MSG: usize = 1024 * 1024;
+/// Outbound queue depth per connection. Comfortably above the honest
+/// client's 8 MiB end-to-end window (≈8 frames of the 1 MiB cap), so a
+/// well-behaved peer never trips it; a peer that stops reading while its
+/// partner floods is dropped rather than buffered without bound (finding:
+/// unbounded queue = remote OOM).
+const OUTBOUND_QUEUE: usize = 24;
+/// How long a connection has to send its request head (and complete the TLS
+/// handshake) before it's dropped — bounds slow-loris parked tasks.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Ceiling on concurrent in-flight connections, so a flood can't exhaust
+/// tasks/fds. Generous for real use; a backstop, not a rate limit.
+const MAX_CONNECTIONS: usize = 4096;
 const PEER_JOINED: &str = r#"{"t":"peer-joined"}"#;
 const PEER_LEFT: &str = r#"{"t":"peer-left"}"#;
 const PING: &str = r#"{"t":"ping"}"#;
@@ -41,6 +55,8 @@ pub struct ServeCfg {
     pub tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
     pub expire_unpaired: Duration,
     pub sweep_every: Duration,
+    /// Deadline to send the request head + complete any TLS handshake.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for ServeCfg {
@@ -51,15 +67,23 @@ impl Default for ServeCfg {
             tls: None,
             expire_unpaired: Duration::from_secs(30 * 60),
             sweep_every: Duration::from_secs(60),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 }
 
-type Tx = mpsc::UnboundedSender<Message>;
+type Tx = mpsc::Sender<Message>;
 
 struct Slot {
     tx: Tx,
     id: u64,
+}
+
+/// Enqueue a message for a peer's socket task. A full queue means that peer
+/// stopped reading while being flooded — treat it as dead (drop the message
+/// and let its task notice the closed channel), never buffer without bound.
+fn enqueue(tx: &Tx, m: Message) {
+    let _ = tx.try_send(m);
 }
 
 #[derive(Default)]
@@ -83,6 +107,13 @@ impl RoomState {
 
 type Rooms = Arc<Mutex<HashMap<String, RoomState>>>;
 
+/// Lock the rooms map, recovering from a poisoned mutex instead of cascading
+/// a panic across every room (the isolation property §4 promises). Locked
+/// sections do only non-panicking `try_send`s, so recovery is safe.
+fn lock_rooms(rooms: &Rooms) -> std::sync::MutexGuard<'_, HashMap<String, RoomState>> {
+    rooms.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct RelayServer {
     pub addr: SocketAddr,
     stop: watch::Sender<bool>,
@@ -90,8 +121,10 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
-    /// Graceful stop: no new connections; existing sockets close as their
-    /// tasks finish.
+    /// Graceful stop: stop accepting, and signal live connections to send a
+    /// 1001 "going away" close to their peers. Awaits the accept loop; the
+    /// per-connection close frames are sent concurrently as their tasks
+    /// observe the stop signal.
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
         if let Some(h) = self.handle.take() {
@@ -160,24 +193,47 @@ pub async fn start(cfg: ServeCfg) -> anyhow::Result<RelayServer> {
     ));
 
     let token = cfg.token.clone();
+    let hs_timeout = cfg.handshake_timeout;
     let mut accept_stop = stop_rx;
+    // Cap concurrent in-flight connections so a flood can't exhaust
+    // tasks/fds (a permit is held for the whole connection lifetime).
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = accept_stop.changed() => return,
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { return };
+                    let (stream, peer) = match accepted {
+                        Ok(p) => p,
+                        // A per-accept error (often transient — EMFILE/ENFILE
+                        // under an fd flood) must NOT kill the listener; log,
+                        // back off briefly, and keep serving.
+                        Err(e) => {
+                            eprintln!("relay: accept error: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+                    // At capacity: drop this connection rather than pile on.
+                    let Ok(permit) = limit.clone().try_acquire_owned() else {
+                        eprintln!("relay: at capacity ({MAX_CONNECTIONS}); dropping {peer}");
+                        drop(stream);
+                        continue;
+                    };
                     let rooms = rooms.clone();
                     let token = token.clone();
                     let acceptor = acceptor.clone();
+                    let stop = accept_stop.clone();
                     let id = conn_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
+                        let _permit = permit; // held until the connection ends
                         match acceptor {
-                            Some(a) => match a.accept(stream).await {
-                                Ok(tls) => handle_conn(tls, rooms, token, id, peer).await,
-                                Err(e) => eprintln!("relay: TLS handshake from {peer} failed: {e}"),
+                            Some(a) => match tokio::time::timeout(hs_timeout, a.accept(stream)).await {
+                                Ok(Ok(tls)) => handle_conn(tls, rooms, token, id, peer, hs_timeout, stop).await,
+                                Ok(Err(e)) => eprintln!("relay: TLS handshake from {peer} failed: {e}"),
+                                Err(_) => eprintln!("relay: TLS handshake from {peer} timed out"),
                             },
-                            None => handle_conn(stream, rooms, token, id, peer).await,
+                            None => handle_conn(stream, rooms, token, id, peer, hs_timeout, stop).await,
                         }
                     });
                 }
@@ -209,22 +265,27 @@ fn reason_of(status: u16) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn<S>(
     mut stream: S,
     rooms: Rooms,
     token: Option<String>,
     id: u64,
     peer: SocketAddr,
+    hs_timeout: Duration,
+    stop: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Read the request head ourselves (see module docs / spike).
+    // Read the request head ourselves (see module docs / spike), under a
+    // deadline so a slow-loris client can't park this task forever.
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let deadline = tokio::time::Instant::now() + hs_timeout;
     let head_end = loop {
         let mut chunk = [0u8; 1024];
-        let n = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(n)) => n,
         };
         buf.extend_from_slice(&chunk[..n]);
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -261,10 +322,16 @@ async fn handle_conn<S>(
                 pos: 0,
                 inner: stream,
             };
-            let ws_cfg = WebSocketConfig::default().max_message_size(Some(MAX_MSG));
+            // Cap BOTH message and frame size: without the frame cap a
+            // single 16 MiB frame (tungstenite's default) buffers before the
+            // message check rejects it, so the real inbound peak would be
+            // 16×, not 1 MiB.
+            let ws_cfg = WebSocketConfig::default()
+                .max_message_size(Some(MAX_MSG))
+                .max_frame_size(Some(MAX_MSG));
             let ws = WebSocketStream::from_raw_socket(pre, Role::Server, Some(ws_cfg)).await;
             eprintln!("relay: {peer} joined room {room} as {}", role.as_str());
-            run_room_conn(ws, rooms, room, role, id).await;
+            run_room_conn(ws, rooms, room, role, id, stop).await;
         }
     }
 }
@@ -277,28 +344,32 @@ async fn run_room_conn<S>(
     room: String,
     role: RoomRole,
     id: u64,
+    mut stop: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE);
     // Join with takeover: close any existing same-role socket (1012); it
     // discovers it was replaced at cleanup (its id no longer registered)
     // and stays silent — the peer keeps its pairing.
     {
-        let mut map = rooms.lock().expect("rooms lock");
+        let mut map = lock_rooms(&rooms);
         let state = map.entry(room.clone()).or_default();
         if let Some(old) = state.slot_mut(role).take() {
-            let _ = old.tx.send(Message::Close(Some(CloseFrame {
-                code: CloseCode::from(1012),
-                reason: "replaced by a new connection".into(),
-            })));
+            enqueue(
+                &old.tx,
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(1012),
+                    reason: "replaced by a new connection".into(),
+                })),
+            );
             eprintln!("relay: room {room} {} taken over", role.as_str());
         }
         *state.slot_mut(role) = Some(Slot { tx: tx.clone(), id });
         if state.slot_mut(role.other()).is_some() {
             for r in [role, role.other()] {
                 if let Some(s) = state.slot_mut(r) {
-                    let _ = s.tx.send(Message::Text(PEER_JOINED.into()));
+                    enqueue(&s.tx, Message::Text(PEER_JOINED.into()));
                 }
             }
             state.alone_since = None;
@@ -310,6 +381,14 @@ async fn run_room_conn<S>(
     let (mut sink, mut stream) = ws.split();
     loop {
         tokio::select! {
+            _ = stop.changed() => {
+                // Graceful shutdown: tell the peer we're going away (1001).
+                let _ = sink.send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(1001),
+                    reason: "server shutting down".into(),
+                }))).await;
+                break;
+            }
             out = rx.recv() => match out {
                 Some(m @ Message::Close(_)) => { let _ = sink.send(m).await; break; }
                 Some(m) => { if sink.send(m).await.is_err() { break; } }
@@ -320,13 +399,21 @@ async fn run_room_conn<S>(
                     if sink.send(Message::Text(PONG.into())).await.is_err() { break; }
                 }
                 Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
-                    let peer_tx = {
-                        let mut map = rooms.lock().expect("rooms lock");
-                        map.get_mut(&room)
-                            .and_then(|s| s.slot_mut(role.other()).as_ref().map(|p| p.tx.clone()))
-                    };
-                    if let Some(p) = peer_tx {
-                        let _ = p.send(m);
+                    // Forward under the lock: try_send never blocks, and an
+                    // overflowing peer (stopped reading while flooded) is
+                    // dropped — bounded queue = no remote OOM.
+                    let mut map = lock_rooms(&rooms);
+                    if let Some(state) = map.get_mut(&room) {
+                        let overflow = match state.slot_mut(role.other()) {
+                            Some(peer) => peer.tx.try_send(m).is_err(),
+                            None => false,
+                        };
+                        if overflow {
+                            // Slow/hostile consumer: unregister it so no more
+                            // frames queue; its own task reaps the socket.
+                            *state.slot_mut(role.other()) = None;
+                            eprintln!("relay: room {room} {} overflowed; dropped", role.other().as_str());
+                        }
                     }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
@@ -337,13 +424,13 @@ async fn run_room_conn<S>(
 
     // Cleanup with takeover suppression: only the currently-registered
     // connection (same id) announces its departure.
-    let mut map = rooms.lock().expect("rooms lock");
+    let mut map = lock_rooms(&rooms);
     if let Some(state) = map.get_mut(&room) {
         let mine = state.slot_mut(role).as_ref().is_some_and(|s| s.id == id);
         if mine {
             *state.slot_mut(role) = None;
             if let Some(peer) = state.slot_mut(role.other()).as_ref() {
-                let _ = peer.tx.send(Message::Text(PEER_LEFT.into()));
+                enqueue(&peer.tx, Message::Text(PEER_LEFT.into()));
                 state.alone_since = Some(Instant::now());
                 eprintln!("relay: room {room} {} left", role.as_str());
             }
@@ -362,20 +449,30 @@ async fn sweeper(rooms: Rooms, expire: Duration, every: Duration, mut stop: watc
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => return,
         }
-        let mut map = rooms.lock().expect("rooms lock");
-        for (room, state) in map.iter_mut() {
-            if state.alone_since.is_some_and(|t| t.elapsed() >= expire) {
-                for role in [RoomRole::Send, RoomRole::Recv] {
-                    if let Some(s) = state.slot_mut(role).as_ref() {
-                        let _ = s.tx.send(Message::Close(Some(CloseFrame {
+        let mut map = lock_rooms(&rooms);
+        map.retain(|room, state| {
+            if !state.alone_since.is_some_and(|t| t.elapsed() >= expire) {
+                return true;
+            }
+            // Expiry is atomic with de-occupancy (the Worker deletes its
+            // alarm on pairing): removing the slot under the same lock
+            // guarantees no concurrent joiner can pair with this doomed
+            // socket and then get a spurious peer-left. `alone_since` is only
+            // ever set on a single-occupant room, so at most one slot exists.
+            for r in [RoomRole::Send, RoomRole::Recv] {
+                if let Some(s) = state.slot_mut(r).take() {
+                    enqueue(
+                        &s.tx,
+                        Message::Close(Some(CloseFrame {
                             code: CloseCode::from(1013),
                             reason: "room expired".into(),
-                        })));
-                    }
+                        })),
+                    );
                 }
-                eprintln!("relay: room {room} expired");
             }
-        }
+            eprintln!("relay: room {room} expired");
+            false // drop the now-empty room
+        });
     }
 }
 
@@ -787,10 +884,17 @@ mod tests {
         let mut send = ws_client(srv.addr, "roomBig", "send").await;
         let _ = next_text(&mut recv).await;
         let _ = next_text(&mut send).await;
-        // over the 1 MiB parity cap → server closes the offender
-        send.send(Message::Binary(vec![0u8; 2 * 1024 * 1024].into()))
+        // Over the 1 MiB parity cap → the server refuses the frame and
+        // closes the offender. With the frame-size cap the refusal can
+        // surface on the write itself (connection closed mid-send) or on a
+        // subsequent read — either way the socket must die, never buffer.
+        if send
+            .send(Message::Binary(vec![0u8; 2 * 1024 * 1024].into()))
             .await
-            .unwrap();
+            .is_err()
+        {
+            return; // refused at write time — the point of the test
+        }
         let died = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match send.next().await {
@@ -802,6 +906,100 @@ mod tests {
         })
         .await;
         assert!(died.is_ok(), "sender socket should be closed");
+    }
+
+    #[tokio::test]
+    async fn flooding_a_stuck_peer_is_bounded_not_ooming() {
+        // A sender that floods a receiver which never reads must not make the
+        // server buffer without bound: the receiver's slot overflows and is
+        // dropped, and the flooder's forwards stop finding a peer. The test's
+        // proof is that the server stays responsive (a fresh room still
+        // pairs) rather than hanging/OOMing.
+        let srv = spawn_server(ServeCfg::default()).await;
+        let mut victim = ws_client(srv.addr, "flood", "recv").await;
+        let mut flooder = ws_client(srv.addr, "flood", "send").await;
+        let _ = next_text(&mut victim).await;
+        let _ = next_text(&mut flooder).await;
+        // Victim never reads again. Flood well past the 24-slot queue.
+        for _ in 0..200 {
+            if flooder
+                .send(Message::Binary(vec![0u8; 900 * 1024].into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        drop(victim);
+        // The server is still healthy: a brand-new room pairs and forwards.
+        let mut r2 = ws_client(srv.addr, "healthy", "recv").await;
+        let mut s2 = ws_client(srv.addr, "healthy", "send").await;
+        assert_eq!(next_text(&mut r2).await, r#"{"t":"peer-joined"}"#);
+        assert_eq!(next_text(&mut s2).await, r#"{"t":"peer-joined"}"#);
+        s2.send(Message::Binary(vec![1, 2, 3].into()))
+            .await
+            .unwrap();
+        loop {
+            match r2.next().await.unwrap().unwrap() {
+                Message::Binary(b) => {
+                    assert_eq!(b.as_ref(), &[1, 2, 3]);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_live_sockets_with_1001() {
+        let srv = spawn_server(ServeCfg::default()).await;
+        let mut recv = ws_client(srv.addr, "roomStop", "recv").await;
+        let mut send = ws_client(srv.addr, "roomStop", "send").await;
+        let _ = next_text(&mut recv).await;
+        let _ = next_text(&mut send).await;
+        srv.shutdown().await;
+        // both live sockets should receive a 1001 going-away close
+        for ws in [&mut recv, &mut send] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Close(f))) => break f.map(|f| u16::from(f.code)),
+                        Some(Ok(_)) => continue,
+                        Some(Err(_)) | None => break None,
+                    }
+                }
+            })
+            .await
+            .expect("timely close");
+            assert_eq!(got, Some(1001), "expected 1001 going-away");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_loris_head_read_times_out() {
+        // A connection that opens but never sends a full head must be reaped,
+        // not parked forever. Use a short handshake budget via a raw socket.
+        let srv = spawn_server(ServeCfg {
+            handshake_timeout: std::time::Duration::from_millis(400),
+            ..Default::default()
+        })
+        .await;
+        let mut sock = tokio::net::TcpStream::connect(srv.addr).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        // partial head, never terminated
+        sock.write_all(b"GET /v1/room/x?role=recv HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        // Within the (short, test-configured) handshake budget the server
+        // closes us; read returns 0.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sock.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "slow-loris connection must be reaped, got {closed:?}"
+        );
     }
 
     #[tokio::test]

@@ -151,3 +151,34 @@ tasks bound per-client memory; room state is O(occupied rooms).
   rejected" (already surfaced as a 401 message by the client).
 - Optional later: metrics endpoint, rate limiting, ACME — only with real
   demand.
+
+## 9. As-built hardening (two-reviewer whole-branch pass)
+
+A native server has none of the platform shields Cloudflare gives the
+Worker, so the review round added the guards a public-facing server needs —
+all with regression tests:
+
+- **Bounded per-connection outbound queue** (was unbounded → unauthenticated
+  remote OOM): a peer that stops reading while being flooded overflows its
+  24-slot queue and is dropped ("slow consumer = dead consumer"); honest
+  clients stay far under it thanks to the 8 MiB end-to-end window.
+- **Handshake deadline + connection cap**: the head read and TLS handshake
+  run under a 10 s budget (configurable), and a semaphore caps concurrent
+  connections at 4096 — slow-loris can no longer park tasks/fds forever.
+- **Accept loop survives errors**: a per-`accept()` error (e.g. EMFILE under
+  an fd flood) logs + backs off + continues instead of killing the listener.
+- **Docker release fix**: the tarball stores `./b2p`, so the GHCR job
+  extracts `./b2p` (the bare `b2p` member did not exist → every release
+  would have failed to publish the image).
+- **Frame-size cap** (`max_frame_size = 1 MiB`): without it a single 16 MiB
+  frame buffered before the message check, making the real inbound peak 16×.
+- **Atomic expiry** (sweeper removes the slot under the lock): closes the
+  narrow sweeper-vs-pairing race where a joiner could pair with a doomed
+  socket and see a spurious peer-left, spuriously failing `b2p send`.
+- **Mutex-poison recovery** (`lock_rooms`): a panic under the rooms lock no
+  longer cascades a server-wide outage, honoring the §4 isolation claim.
+- **Graceful shutdown**: live sockets now receive a 1001 "going away" close.
+- Known benign parity NITs left as-is (uncaught by test.mjs): duplicate
+  `Authorization` is last-wins here vs comma-joined on the Worker; the 426
+  gate additionally requires `Connection: upgrade` + `Sec-WebSocket-Key`.
+  Real clients send all three; neither is exploitable.
