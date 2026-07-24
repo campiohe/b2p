@@ -20,6 +20,21 @@ spec phase they belong to. See `b2p-v2-spec.md` and
       the sole default transport there is nothing to negotiate; revisit if
       LAN-direct (P3) lands and ordering matters again.
 
+### relay serve — shipped
+
+- [x] **`b2p relay serve`: self-hostable native relay** — full protocol-v1
+      parity (pairing, takeover, expiry, token, healthz), optional built-in
+      TLS, Docker image on GHCR, CI conformance via relay-worker/test.mjs;
+      the offline test suite now runs against this real server (the old
+      hand-rolled mock is gone). See
+      `docs/superpowers/specs/2026-07-23-b2p-relay-serve-design.md` and
+      `docs/superpowers/plans/2026-07-23-b2p-relay-serve.md`.
+- [ ] Built-in ACME/Let's Encrypt certs — only with real demand (Caddy
+      covers it).
+- [ ] Metrics endpoint / rate limiting — only with real demand.
+- [ ] Standalone protocol document if third-party relay implementations
+      appear.
+
 ### P2b deferred follow-ups
 
 - [ ] **Custom-domain recipe** for networks that category-block

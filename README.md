@@ -52,6 +52,32 @@ config file; `b2p relay show` prints it.)
 The free tier comfortably covers personal use — dozens of multi-GB transfers a
 day; the relay never stores data.
 
+## Self-host the relay (alternative to Cloudflare)
+
+The same `b2p` binary can be the relay — any VPS, home server, or container
+platform works:
+
+    b2p relay serve                          # plain ws on 0.0.0.0:9009
+    b2p relay serve --token S3CR3T           # require a bearer token
+    b2p relay serve --tls-cert c.pem --tls-key k.pem   # built-in TLS
+
+or with Docker:
+
+    docker run -p 9009:9009 -e RELAY_TOKEN=S3CR3T ghcr.io/campiohe/b2p:latest
+
+For internet use put TLS in front (unless using --tls-cert). Caddy does it in
+two lines with automatic Let's Encrypt certificates:
+
+    relay.example.com {
+        reverse_proxy 127.0.0.1:9009
+    }
+
+(Kubernetes: terminate TLS at the ingress and point it at port 9009.) Then on
+each machine: `b2p relay set wss://relay.example.com`. The Cloudflare Worker
+(`relay-worker/`) and `b2p relay serve` implement the same protocol and are
+interchangeable; `relay-worker/test.mjs` is the conformance suite for both —
+CI runs it against `b2p relay serve` on every push.
+
 ## Usage
 
 On the receiving machine:
@@ -112,9 +138,10 @@ Two alternative transports predate the relay and remain available:
   the proxy's root CA is installed.
 - Folder transfers briefly need ~2× the transfer size free on both sides
   (tar spool on the sender, staging area on the receiver).
-- `cargo test` runs the full offline test suite (an in-process mock relay
-  stands in for the Worker). `B2P_TEST_RELAY_URL=wss://… cargo test --test
-  relay_live` runs a live smoke against your deployed Worker.
+- `cargo test` runs the full offline test suite (transfers run against the
+  built-in `relay serve` server on an ephemeral port).
+  `B2P_TEST_RELAY_URL=wss://… cargo test --test relay_live` runs a live smoke
+  against your deployed Worker.
 - Some corporate filters category-block `*.workers.dev`; putting a custom
   domain in front of the Worker sidesteps that (future recipe). Proxies that
   require explicit HTTP CONNECT configuration are not supported yet.
