@@ -165,6 +165,22 @@ enum RelayCmd {
     },
     /// Print the configured relay.
     Show,
+    /// Run a relay server on this machine (protocol-compatible with the
+    /// Cloudflare Worker in relay-worker/).
+    Serve {
+        /// Address to listen on
+        #[arg(long, default_value = "0.0.0.0:9009")]
+        listen: std::net::SocketAddr,
+        /// Require this bearer token (falls back to env RELAY_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// PEM certificate chain — serve TLS directly (else put a proxy in front)
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -234,6 +250,41 @@ async fn run() -> anyhow::Result<()> {
                     ),
                     None => println!("(none configured)"),
                 }
+                Ok(())
+            }
+            RelayCmd::Serve {
+                listen,
+                token,
+                tls_cert,
+                tls_key,
+            } => {
+                let token = token.or_else(|| std::env::var("RELAY_TOKEN").ok());
+                let tls = tls_cert.zip(tls_key);
+                let secure = tls.is_some();
+                let cfg = b2p::relay_server::ServeCfg {
+                    listen,
+                    token: token.clone(),
+                    tls,
+                    ..Default::default()
+                };
+                let server = b2p::relay_server::start(cfg).await?;
+                eprintln!(
+                    "b2p relay listening on {} ({}{})",
+                    server.addr,
+                    if secure {
+                        "wss — built-in TLS"
+                    } else {
+                        "ws — plain; put TLS (Caddy/nginx/ingress) in front for internet use"
+                    },
+                    if token.is_some() {
+                        ", token required"
+                    } else {
+                        ""
+                    },
+                );
+                tokio::signal::ctrl_c().await?;
+                eprintln!("shutting down");
+                server.shutdown().await;
                 Ok(())
             }
         },
@@ -792,6 +843,25 @@ mod tests {
         assert!(!b2p::rvcode::is_rendezvous_code(
             "https://x.trycloudflare.com#abc"
         ));
+    }
+
+    #[test]
+    fn relay_serve_flags_validate() {
+        use clap::Parser;
+        // tls flags require each other
+        assert!(Cli::try_parse_from(["b2p", "relay", "serve", "--tls-cert", "c.pem"]).is_err());
+        assert!(Cli::try_parse_from(["b2p", "relay", "serve", "--tls-key", "k.pem"]).is_err());
+        // happy path parses with a custom listen addr
+        let cli =
+            Cli::try_parse_from(["b2p", "relay", "serve", "--listen", "127.0.0.1:7777"]).unwrap();
+        match cli.cmd {
+            Cmd::Relay {
+                cmd: RelayCmd::Serve { listen, .. },
+            } => {
+                assert_eq!(listen.port(), 7777);
+            }
+            _ => panic!("expected relay serve"),
+        }
     }
 
     #[test]
