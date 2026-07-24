@@ -96,6 +96,9 @@ jobs:
           files: artifacts/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # A hyphen in the tag (v0.5.0-rc.1) means pre-release: marked as
+          # such on GitHub and never shown as "Latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   docker:
     name: Publish Docker image
@@ -125,6 +128,10 @@ jobs:
       - name: Build and push
         run: |
           IMAGE=ghcr.io/${{ github.repository }}
-          docker build -t "$IMAGE:${GITHUB_REF_NAME}" -t "$IMAGE:latest" .
+          docker build -t "$IMAGE:${GITHUB_REF_NAME}" .
           docker push "$IMAGE:${GITHUB_REF_NAME}"
-          docker push "$IMAGE:latest"
+          # Only stable tags (no pre-release hyphen) move :latest.
+          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+            docker tag "$IMAGE:${GITHUB_REF_NAME}" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
