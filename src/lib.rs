@@ -10,6 +10,7 @@ pub mod http;
 pub mod pake;
 pub mod progress;
 pub mod protocol;
+pub mod relay_server;
 pub mod rendezvous;
 pub mod rvcode;
 pub mod send;
