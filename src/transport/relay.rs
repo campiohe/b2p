@@ -771,37 +771,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_role_is_a_room_busy_error() {
-        let relay = crate::transport::mock::start().await;
-        let tls = TlsOpts::default();
-        // First receiver parks in the room, waiting for a sender.
-        let first = tokio::spawn({
-            let url = relay.url.clone();
-            async move {
-                connect(
-                    &url,
-                    "roomDup",
-                    Role::Receiver,
-                    None,
-                    &TlsOpts::default(),
-                    Duration::from_secs(30),
-                )
-                .await
+    async fn http_409_maps_to_room_busy() {
+        // The real server (like the Worker) does takeover, so 409 comes only
+        // from older/stale deployments — pin the client's classification
+        // with a stub that always answers 409.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
             }
         });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let second = connect(
-            &relay.url,
+        let e = connect(
+            &url,
             "roomDup",
             Role::Receiver,
             None,
-            &tls,
+            &TlsOpts::default(),
             Duration::from_secs(5),
         )
-        .await;
-        let e = second.err().expect("duplicate role must be refused");
+        .await
+        .err()
+        .expect("409 must be an error");
         assert!(e.downcast_ref::<RoomBusy>().is_some(), "got: {e:#}");
-        first.abort();
     }
 
     #[tokio::test]
