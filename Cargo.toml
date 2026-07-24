@@ -37,11 +37,8 @@ url = "2"
 walkdir = "2"
 sha2 = "0.10"
 hex = "0.4"
-hmac = "0.12"
 httparse = "1"
-sha1 = "0.10"
 spake2 = "0.4"
-webrtc = "0.17"
 x509-parser = "0.17"
 
 [dev-dependencies]

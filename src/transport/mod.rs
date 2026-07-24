@@ -1,8 +1,7 @@
-//! Transport layer: moves the encrypted payload once peers have met on the
-//! rendezvous. P1d ships the WebRTC data-channel transport; the tunnel path
-//! (P0) keeps its own code and is selected by code form in P1e.
+//! Transport layer: moves the encrypted payload between the two peers.
+//! Since v0.4.0 there is one transport — the relay (`relay::RelayChannel`),
+//! reached over an outbound WebSocket from both sides.
 
 #[cfg(test)]
 pub mod mock;
 pub mod relay;
-pub mod webrtc;

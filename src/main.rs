@@ -7,43 +7,13 @@ use b2p::{archive, progress, send, server, tunnel};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-/// STUN servers offered to the WebRTC ICE agent for the P1 (default) stack.
-const STUN_SERVERS: [&str; 2] = [
-    "stun:stun.l.google.com:19302",
-    "stun:stun.cloudflare.com:3478",
-];
-/// Default rendezvous service (ntfy.sh) used to run the PAKE handshake and
-/// exchange SDP/ICE for the P1 stack.
-const DEFAULT_RENDEZVOUS: &str = "https://ntfy.sh";
-/// How long to wait for the WebRTC connection to form before giving up and
-/// running the doctor. Bounds the *whole* negotiation (ntfy subscribe, SDP
-/// offer/answer, ICE trickle + connectivity checks, DTLS, SCTP), so a
-/// slow-but-viable WAN path needs headroom; the extra wait is only felt on
-/// failure.
+/// How long a sender sits in the relay room waiting for the receiver to show
+/// up and pair before giving up and running the doctor.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long a receiver sits in the relay room waiting for its sender.
 const WAIT_FOR_SENDER: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// The STUN defaults as a single `IceServer` (no credentials). TURN entries are
-/// appended in `ice_servers` (Task 3).
-fn default_ice_servers() -> Vec<b2p::turn::IceServer> {
-    vec![b2p::turn::IceServer {
-        urls: STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
-        username: String::new(),
-        credential: String::new(),
-    }]
-}
-
-/// STUN defaults plus any resolved TURN servers. Errors if `--turn` was given
-/// without a credential mode.
-fn ice_servers(turn: &TurnArgs) -> anyhow::Result<Vec<b2p::turn::IceServer>> {
-    let mut servers = default_ice_servers();
-    servers.extend(turn.resolve()?);
-    Ok(servers)
-}
 
 #[derive(Parser)]
 #[command(name = "b2p", version, about = "Encrypted peer-to-peer file transfer")]
@@ -55,42 +25,9 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// TURN relay flags shared by `receive` and `send` (design §4). With no flags,
-/// the transport stays STUN-only. Only the peer that allocates a relay needs
-/// credentials (design §3.1), so either peer may set these independently.
-#[derive(clap::Args, Clone)]
-struct TurnArgs {
-    /// TURN relay URL, --p2p only (turn: UDP only — webrtc-ice can't do TLS/TCP). Repeat for several.
-    #[arg(long = "turn", requires = "p2p")]
-    turn: Vec<String>,
-    /// coturn use-auth-secret shared secret; b2p mints a short-lived credential.
-    #[arg(long, requires = "p2p", conflicts_with_all = ["turn_user", "turn_pass"])]
-    turn_secret: Option<String>,
-    /// Static TURN username (requires --turn-pass).
-    #[arg(long, requires_all = ["turn_pass", "p2p"], conflicts_with = "turn_secret")]
-    turn_user: Option<String>,
-    /// Static TURN password (requires --turn-user).
-    #[arg(long, requires_all = ["turn_user", "p2p"], conflicts_with = "turn_secret")]
-    turn_pass: Option<String>,
-}
-
-impl TurnArgs {
-    fn resolve(&self) -> anyhow::Result<Vec<b2p::turn::IceServer>> {
-        // Random nonce disambiguates concurrent coturn allocations.
-        let nonce = format!("{:08x}", rand::random::<u32>());
-        b2p::turn::resolve(
-            &self.turn,
-            self.turn_secret.as_deref(),
-            self.turn_user.as_deref(),
-            self.turn_pass.as_deref(),
-            &nonce,
-        )
-    }
-}
-
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for a transfer through the relay (default) or P2P/tunnel.
+    /// Wait for a transfer through the relay (default) or tunnel.
     Receive {
         /// Output directory (default: current directory)
         #[arg(long, default_value = ".")]
@@ -110,14 +47,6 @@ enum Cmd {
         /// Relay URL override (default: config / B2P_RELAY)
         #[arg(long, conflicts_with = "tunnel")]
         relay: Option<String>,
-        /// Use the direct peer-to-peer WebRTC stack instead of the relay
-        #[arg(long, conflicts_with = "tunnel")]
-        p2p: bool,
-        /// Rendezvous base URL for --p2p (default: https://ntfy.sh)
-        #[arg(long, requires = "p2p")]
-        rendezvous: Option<String>,
-        #[command(flatten)]
-        turn: TurnArgs,
     },
     /// Send files, folders, or text to a waiting receiver.
     Send {
@@ -132,14 +61,6 @@ enum Cmd {
         /// Relay URL override (default: config / B2P_RELAY / the code itself)
         #[arg(long)]
         relay: Option<String>,
-        /// Use the direct peer-to-peer WebRTC stack instead of the relay
-        #[arg(long)]
-        p2p: bool,
-        /// Rendezvous base URL for --p2p (default: https://ntfy.sh)
-        #[arg(long, requires = "p2p")]
-        rendezvous: Option<String>,
-        #[command(flatten)]
-        turn: TurnArgs,
     },
     /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
     Doctor {
@@ -204,14 +125,9 @@ async fn run() -> anyhow::Result<()> {
             overwrite,
             tunnel,
             relay,
-            p2p,
-            rendezvous,
-            turn,
         } => {
             if tunnel {
                 receive_tunnel(out, direct, yes, overwrite, &tls).await
-            } else if p2p {
-                receive_p1_cli(out, yes, overwrite, rendezvous, turn, &tls).await
             } else {
                 receive_relay_cli(out, yes, overwrite, relay, &tls).await
             }
@@ -221,10 +137,7 @@ async fn run() -> anyhow::Result<()> {
             paths,
             text,
             relay,
-            p2p,
-            rendezvous,
-            turn,
-        } => do_send(code, paths, text, relay, p2p, rendezvous, turn, &tls).await,
+        } => do_send(code, paths, text, relay, &tls).await,
         Cmd::Relay { cmd } => match cmd {
             RelayCmd::Set { url, token } => {
                 let url = b2p::transport::relay::normalize_relay_url(&url)?;
@@ -439,59 +352,6 @@ fn accept_decision(
     line.trim().eq_ignore_ascii_case("y")
 }
 
-/// P1 (default) receive path: PAKE handshake + WebRTC transport over the
-/// rendezvous service, no tunnel or local server involved. A live
-/// byte-accurate progress bar is deferred to a follow-up — this prints
-/// status lines instead of animating one.
-async fn receive_p1_cli(
-    out: PathBuf,
-    yes: bool,
-    overwrite: bool,
-    rendezvous: Option<String>,
-    turn: TurnArgs,
-    tls: &TlsOpts,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&out)?;
-    // Resolve ICE servers early so a bad --turn combo fails before we print a code.
-    let ice = ice_servers(&turn)?;
-    let code = b2p::rvcode::RendezvousCode::generate_human();
-    eprintln!("\nOn the other machine, run:\n");
-    println!("    b2p send {code} <files...>\n");
-    eprintln!("Waiting for the sender...");
-
-    let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
-    let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
-        Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-    let out_for_accept = out.clone();
-    let accept =
-        move |m: &b2p::protocol::Manifest| accept_decision(m, &out_for_accept, yes, overwrite);
-
-    let desc = match b2p::session::receive_p1(
-        rv,
-        &code.topic,
-        &code.secret.0,
-        &out,
-        accept,
-        &ice,
-        CONNECT_TIMEOUT,
-        None,
-    )
-    .await
-    {
-        Ok(d) => d,
-        // Only an establishment (handshake/connect) failure runs the doctor
-        // (design §6) — a transfer-phase error (declined, hash mismatch,
-        // version mismatch) is returned as-is for `main` to print once.
-        Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
-            return connect_failed(e, base, tls).await
-        }
-        Err(e) => return Err(e),
-    };
-    eprintln!("via WebRTC");
-    eprintln!("Done: {desc}");
-    Ok(())
-}
-
 /// Default (P2b) receive path: everything through the operator's relay.
 /// One code, re-armed across sender retries — a dropped connection resumes
 /// from the staged chunks instead of restarting.
@@ -599,15 +459,11 @@ async fn receive_relay_cli(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn do_send(
     code: String,
     paths: Vec<PathBuf>,
     text: Option<String>,
     relay_flag: Option<String>,
-    p2p: bool,
-    rendezvous: Option<String>,
-    turn: TurnArgs,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
     // Classify/parse the code BEFORE `archive::prepare`, which can tar a
@@ -622,13 +478,6 @@ async fn do_send(
         Dest::Tunnel(Code::parse(&code).context("invalid code — paste it exactly as printed")?)
     };
 
-    // Resolve TURN before the (possibly long) tar so a bad --turn combo fails
-    // fast, mirroring the code parse above. It only applies to the WebRTC path.
-    let ice = ice_servers(&turn)?;
-    if !turn.turn.is_empty() && matches!(dest, Dest::Tunnel(_)) {
-        eprintln!("note: --turn only applies to the WebRTC path; ignoring it for this tunnel code");
-    }
-
     let source = match &text {
         Some(t) => archive::prepare_text(t),
         None => {
@@ -637,7 +486,7 @@ async fn do_send(
         }
     };
     match dest {
-        Dest::Rendezvous(rc) if !p2p => {
+        Dest::Rendezvous(rc) => {
             // Default (P2b): send through the relay.
             let cfg = b2p::config::load()?;
             let relay = b2p::config::resolve_relay(
@@ -679,44 +528,6 @@ async fn do_send(
             eprintln!("Done: {desc}");
             Ok(())
         }
-        Dest::Rendezvous(rc) => {
-            let base = rendezvous.as_deref().unwrap_or(DEFAULT_RENDEZVOUS);
-            let rv: Arc<dyn b2p::rendezvous::Rendezvous> =
-                Arc::new(b2p::rendezvous::ntfy::NtfyRendezvous::new(base, tls)?);
-            let bar = match &source {
-                archive::Source::Blob { total_size, .. } => {
-                    Some(progress::transfer_bar(*total_size))
-                }
-                archive::Source::Text { .. } => None,
-            };
-            eprintln!("Waiting for the receiver...");
-            let desc = match b2p::session::send_p1(
-                rv,
-                &rc.topic,
-                &rc.secret.0,
-                &source,
-                &ice,
-                CONNECT_TIMEOUT,
-                bar.clone(),
-            )
-            .await
-            {
-                Ok(d) => d,
-                // Only an establishment (handshake/connect) failure runs the
-                // doctor (design §6) — a transfer-phase error is returned
-                // as-is for `main` to print once.
-                Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
-                    return connect_failed(e, base, tls).await
-                }
-                Err(e) => return Err(e),
-            };
-            if let Some(b) = bar {
-                b.finish();
-            }
-            eprintln!("via WebRTC");
-            eprintln!("Done: {desc}");
-            Ok(())
-        }
         Dest::Tunnel(code) => {
             // v1 tunnel code
             let bar = match &source {
@@ -736,20 +547,13 @@ async fn do_send(
     }
 }
 
-/// Run on a P1 establishment failure (design §6: handshake/connect only —
+/// Run on a relay establishment failure (design §6: dial/handshake only —
 /// never a transfer-phase error, see `EstablishError`): print the error, run
-/// the doctor, and surface both to the user.
+/// the doctor against the failing relay itself, and surface both to the user.
 ///
 /// Prints the full error itself (via `{e:#}`) and returns a short, distinct
 /// error so `main`'s own `error: {e:#}` doesn't repeat the same text —
 /// callers should propagate this return value as-is, not re-wrap `e`.
-///
-/// `rendezvous_base` is used only to point the doctor's DNS check at the
-/// right host. Note the doctor's rendezvous-*reachability* check is still
-/// hard-coded to ntfy.sh regardless of `--rendezvous` (a known limitation
-/// for custom rendezvous hosts — a follow-up; see src/doctor.rs).
-/// Relay-path variant of `connect_failed`: the doctor probes the failing
-/// relay itself, so the report names the actual blocker.
 async fn connect_failed_relay(
     e: anyhow::Error,
     relay: &b2p::config::RelayCfg,
@@ -762,29 +566,6 @@ async fn connect_failed_relay(
         cafile: tls.cafile.clone(),
         relay: Some(relay.url.clone()),
         relay_token: relay.token.clone(),
-    })
-    .await;
-    eprintln!("{report}");
-    Err(anyhow::anyhow!(
-        "could not establish a connection (see diagnostics above)"
-    ))
-}
-
-async fn connect_failed(
-    e: anyhow::Error,
-    rendezvous_base: &str,
-    tls: &TlsOpts,
-) -> anyhow::Result<()> {
-    eprintln!("\nCould not connect: {e:#}");
-    eprintln!("Running diagnostics (b2p doctor)...\n");
-    let host = url::Url::parse(rendezvous_base)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string));
-    let report = b2p::doctor::run(&b2p::doctor::DoctorArgs {
-        target_host: host,
-        cafile: tls.cafile.clone(),
-        relay: None,
-        relay_token: None,
     })
     .await;
     eprintln!("{report}");
@@ -861,71 +642,6 @@ mod tests {
                 assert_eq!(listen.port(), 7777);
             }
             _ => panic!("expected relay serve"),
-        }
-    }
-
-    #[test]
-    fn turn_flags_validate() {
-        use clap::Parser;
-        // the whole TURN family (and --rendezvous) now requires --p2p
-        assert!(Cli::try_parse_from(["b2p", "receive", "--turn", "turn:h:3478"]).is_err());
-        assert!(Cli::try_parse_from(["b2p", "receive", "--rendezvous", "https://x"]).is_err());
-        // --turn-user requires --turn-pass
-        assert!(Cli::try_parse_from(["b2p", "receive", "--p2p", "--turn-user", "u"]).is_err());
-        // --turn-secret conflicts with static creds
-        assert!(Cli::try_parse_from([
-            "b2p",
-            "receive",
-            "--p2p",
-            "--turn-secret",
-            "s",
-            "--turn-user",
-            "u",
-            "--turn-pass",
-            "p"
-        ])
-        .is_err());
-        // valid: udp turn: + --turn-secret on send (with --p2p)
-        let cli = Cli::try_parse_from([
-            "b2p",
-            "send",
-            "7-a-b",
-            "f",
-            "--p2p",
-            "--turn",
-            "turn:h:3478",
-            "--turn-secret",
-            "s",
-        ])
-        .unwrap();
-        if let Cmd::Send { turn, .. } = cli.cmd {
-            assert!(turn.resolve().is_ok());
-        } else {
-            panic!("expected send");
-        }
-        // turns: (TLS) rejected at resolve() — webrtc-ice is UDP-only
-        let cli = Cli::try_parse_from([
-            "b2p",
-            "receive",
-            "--p2p",
-            "--turn",
-            "turns:h:5349",
-            "--turn-secret",
-            "s",
-        ])
-        .unwrap();
-        if let Cmd::Receive { turn, .. } = cli.cmd {
-            assert!(turn.resolve().is_err());
-        } else {
-            panic!("expected receive");
-        }
-        // --turn with no creds fails at resolve()
-        let cli =
-            Cli::try_parse_from(["b2p", "receive", "--p2p", "--turn", "turn:h:3478"]).unwrap();
-        if let Cmd::Receive { turn, .. } = cli.cmd {
-            assert!(turn.resolve().is_err());
-        } else {
-            panic!("expected receive");
         }
     }
 
