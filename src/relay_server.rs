@@ -764,6 +764,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn takeover_replaces_old_socket_without_spurious_peer_left() {
+        let srv = spawn_server(ServeCfg::default()).await;
+        let mut recv = ws_client(srv.addr, "roomT", "recv").await;
+        let mut send1 = ws_client(srv.addr, "roomT", "send").await;
+        assert_eq!(next_text(&mut recv).await, r#"{"t":"peer-joined"}"#);
+        assert_eq!(next_text(&mut send1).await, r#"{"t":"peer-joined"}"#);
+
+        let mut send2 = ws_client(srv.addr, "roomT", "send").await;
+        // the old sender is closed by the server (1012)
+        let old_closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match send1.next().await {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    _ => continue,
+                }
+            }
+        })
+        .await;
+        assert!(old_closed.is_ok(), "old sender must be closed on takeover");
+        // the newcomer pairs; the receiver hears peer-joined, NOT peer-left
+        assert_eq!(next_text(&mut send2).await, r#"{"t":"peer-joined"}"#);
+        assert_eq!(
+            next_text(&mut recv).await,
+            r#"{"t":"peer-joined"}"#,
+            "receiver must re-pair without a spurious peer-left"
+        );
+        // and the new pairing forwards
+        send2
+            .send(Message::Binary(vec![1, 2, 3].into()))
+            .await
+            .unwrap();
+        loop {
+            match recv.next().await.unwrap().unwrap() {
+                Message::Binary(b) => {
+                    assert_eq!(b.as_ref(), &[1, 2, 3]);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lone_room_expires_and_paired_room_does_not() {
+        let srv = spawn_server(ServeCfg {
+            expire_unpaired: std::time::Duration::from_millis(300),
+            sweep_every: std::time::Duration::from_millis(100),
+            ..Default::default()
+        })
+        .await;
+        // paired room survives well past the expiry window
+        let mut r1 = ws_client(srv.addr, "paired", "recv").await;
+        let mut s1 = ws_client(srv.addr, "paired", "send").await;
+        let _ = next_text(&mut r1).await;
+        let _ = next_text(&mut s1).await;
+        // lone room gets closed with 1013
+        let mut lone = ws_client(srv.addr, "lone", "recv").await;
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match lone.next().await {
+                    Some(Ok(Message::Close(f))) => break f,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => break None,
+                }
+            }
+        })
+        .await
+        .expect("lone room must be expired");
+        if let Some(f) = expired {
+            assert_eq!(u16::from(f.code), 1013, "close code should be 1013");
+        }
+        // the paired room is still alive and forwarding
+        s1.send(Message::Binary(vec![7].into())).await.unwrap();
+        loop {
+            match r1.next().await.unwrap().unwrap() {
+                Message::Binary(b) => {
+                    assert_eq!(b.as_ref(), &[7]);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prefixed_replays_then_passes_through() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (client, server) = tokio::io::duplex(64);
