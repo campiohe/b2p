@@ -36,3 +36,17 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+      - name: Set up Node 22 (conformance script)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Relay conformance (test.mjs vs b2p relay serve)
+        run: |
+          cargo build
+          ./target/debug/b2p relay serve --listen 127.0.0.1:9009 &
+          SERVER=$!
+          sleep 2
+          node relay-worker/test.mjs ws://127.0.0.1:9009
+          kill $SERVER
