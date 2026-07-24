@@ -104,32 +104,16 @@ Flags: `receive --out DIR` (destination), `--yes` (no accept prompt),
 If the connection drops mid-transfer, the receiver keeps waiting and the code
 stays valid — re-run the same `send` command and only the missing chunks are
 sent (the receiver reports what it already staged, matched by content
-fingerprint). This works on both the relay and `--tunnel` paths.
+fingerprint).
 
 ## Diagnostics
 
     b2p doctor            # DNS filtering, TLS inspection, UDP/STUN, relay reachability
-    b2p doctor '<code>'   # same checks, aimed at a specific code's host
+    b2p doctor <host>     # same checks, aimed at a specific host or URL
 
 Every check names the layer and ends with a one-line verdict; the relay check
 does a real WebSocket connect + ping round-trip. `b2p send` runs the doctor
 automatically when it cannot reach the receiver.
-
-## Advanced: direct P2P (`--p2p`) and the tunnel (`--tunnel`)
-
-Two alternative transports predate the relay and remain available:
-
-- `--p2p` on both sides uses the WebRTC stack: ntfy.sh rendezvous + STUN, with
-  optional UDP TURN for symmetric NAT (`--turn turn:host:3478` plus
-  `--turn-secret S` or `--turn-user U --turn-pass P`; `turn:` UDP only — the
-  WebRTC engine can't do TURN over TLS/TCP). Fast and free when it works, but
-  it is exactly the path that fails on CGNAT/UDP-blocked networks — that's why
-  the relay is the default. `--rendezvous <URL>` overrides the signaling host.
-- `receive --tunnel` uses the v1 Cloudflare-tunnel path (auto-detected by the
-  sender from the `https://…#…` code form). `--direct` (with `--tunnel`)
-  serves directly on the LAN. The first `--tunnel` run downloads a pinned,
-  checksum-verified `cloudflared` binary. On DNS-filtered networks the sender
-  re-resolves the tunnel host over DNS-over-HTTPS.
 
 ## Notes
 

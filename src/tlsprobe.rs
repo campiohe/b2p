@@ -57,13 +57,10 @@ pub fn issuer_of(der: &[u8]) -> anyhow::Result<String> {
     Ok(cert.issuer().to_string())
 }
 
-/// Load PEM certificates for use as extra trust roots. Mirrors
-/// `http::load_pem_certs`'s empty-file guard: `rustls_pemfile::certs()`
-/// silently filters out non-certificate PEM items, so a garbage file would
-/// otherwise parse to `Ok(vec![])` here while `http.rs` (which parses the
-/// same bytes via `reqwest::Certificate::from_pem_bundle`) rejects it — the
-/// two loaders must return the same verdict for the same `--cafile`, even
-/// though they build different certificate types and so can't share code.
+/// Load PEM certificates for use as extra trust roots (`--cafile`).
+/// `rustls_pemfile::certs()` silently filters out non-certificate PEM items,
+/// so a garbage file would otherwise parse to `Ok(vec![])` — the explicit
+/// empty-set guard turns that into a loud error instead of a silent no-op.
 pub fn load_pem_roots(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let pem = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut &pem[..]).collect();

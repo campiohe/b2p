@@ -1,6 +1,6 @@
 //! `b2p doctor`: name exactly which network layer is broken (DNS / TLS /
-//! UDP / HTTPS reachability) and say what to do about it — instead of the
-//! old generic "check the code and their tunnel". Spec: b2p-v2-spec.md §6.
+//! UDP / relay reachability) and say what to do about it — instead of a
+//! generic "could not connect".
 
 use crate::http::TlsOpts;
 use std::fmt;
@@ -8,22 +8,28 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The v1 transport's domain — the default diagnosis target.
-pub const DEFAULT_TARGET: &str = "trycloudflare.com";
+/// Generic DNS canary when no relay is configured and no target was given.
+pub const DEFAULT_TARGET: &str = "www.google.com";
 /// Mainstream host whose certificate issuer reveals TLS inspection.
 const TLS_CANARY: &str = "www.google.com";
-/// The planned v2 default rendezvous (P1); P0 only reports reachability.
-const RENDEZVOUS_HEALTH: &str = "https://ntfy.sh/v1/health";
 pub const STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct DoctorArgs {
-    /// Host to test at the DNS layer (from a code, or DEFAULT_TARGET).
+    /// Host to test at the DNS layer (defaults to the relay's host, then
+    /// DEFAULT_TARGET).
     pub target_host: Option<String>,
     pub cafile: Option<PathBuf>,
     /// Relay to probe (wss://…), when one is configured or being debugged.
     pub relay: Option<String>,
     pub relay_token: Option<String>,
+}
+
+/// Host part of a ws:// or wss:// relay URL, for DNS-layer targeting.
+fn relay_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,7 +40,7 @@ pub enum Outcome {
 }
 
 pub struct Check {
-    /// Stable id used by verdict logic: "dns" | "tls" | "stun" | "rendezvous" | "relay".
+    /// Stable id used by verdict logic: "dns" | "tls" | "stun" | "relay".
     pub name: &'static str,
     /// Human-facing line prefix, e.g. "DNS (trycloudflare.com)".
     pub label: String,
@@ -62,17 +68,23 @@ impl fmt::Display for DoctorReport {
 }
 
 pub async fn run(args: &DoctorArgs) -> DoctorReport {
-    let target = args.target_host.as_deref().unwrap_or(DEFAULT_TARGET);
+    // DNS-layer target: an explicit host wins, else the relay's own host
+    // (the name that actually has to resolve for transfers), else a canary.
+    let from_relay = args.relay.as_deref().and_then(relay_host);
+    let target = args
+        .target_host
+        .as_deref()
+        .or(from_relay.as_deref())
+        .unwrap_or(DEFAULT_TARGET);
     let tls = TlsOpts {
         cafile: args.cafile.clone(),
     };
-    let (dns, tls_c, stun, rendezvous) = tokio::join!(
+    let (dns, tls_c, stun) = tokio::join!(
         dns_check(target),
         tls_check(args.cafile.clone()),
         stun_check(),
-        rendezvous_check(&tls, RENDEZVOUS_HEALTH),
     );
-    let mut checks = vec![dns, tls_c, stun, rendezvous];
+    let mut checks = vec![dns, tls_c, stun];
     if let Some(url) = &args.relay {
         checks.push(relay_check(url, args.relay_token.as_deref(), &tls).await);
     }
@@ -81,8 +93,8 @@ pub async fn run(args: &DoctorArgs) -> DoctorReport {
 }
 
 /// WSS connect + ping/pong round-trip against the configured relay, on a
-/// throwaway room. The one check that exercises the default transport's
-/// actual path (TLS + WebSocket upgrade + Worker + Durable Object).
+/// throwaway room. The one check that exercises the transport's actual path
+/// (TLS + WebSocket upgrade + the relay itself — Worker or `relay serve`).
 pub(crate) async fn relay_check(url: &str, token: Option<&str>, tls: &TlsOpts) -> Check {
     let label = format!("relay ({url})");
     let bounded = tokio::time::timeout(
@@ -232,63 +244,38 @@ async fn stun_check() -> Check {
         outcome,
         detail,
     };
-    // Query both STUN servers from ONE socket and compare mapped ports — a
-    // reachability-only probe passes behind a symmetric NAT that then fails
-    // every cross-network transfer (the false all-clear this check closes).
+    // Query both STUN servers from ONE socket and compare mapped ports.
+    // b2p's relay transport never touches UDP — this check characterizes the
+    // network (it explains why P2P tools fail here) rather than gating b2p.
     match crate::stun::nat_mapping(&STUN_SERVERS, Duration::from_secs(3)).await {
         crate::stun::NatMapping::EndpointIndependent(addr) => make(
             Outcome::Ok,
             format!(
                 "UDP egress works; mapped to {addr} from every STUN server — \
-                 endpoint-independent NAT, direct WebRTC viable"
+                 endpoint-independent (P2P-friendly) NAT"
             ),
         ),
         crate::stun::NatMapping::OneResponse(addr) => make(
             Outcome::Ok,
             format!(
                 "UDP egress works (mapped to {addr}; only one STUN server answered, so NAT \
-                 mapping is unclassified) — WebRTC likely viable"
+                 mapping is unclassified)"
             ),
         ),
         crate::stun::NatMapping::Symmetric(addrs) => make(
             Outcome::Warn,
             format!(
                 "UDP egress works, but this NAT is symmetric (mapped addresses differ: {addrs:?}) \
-                 — direct WebRTC to another NAT'd peer will likely fail; use a TURN relay \
-                 (--turn) or --tunnel"
+                 — hostile to P2P protocols generally; b2p's relay transport (TCP/443) is \
+                 unaffected"
             ),
         ),
         crate::stun::NatMapping::NoResponse => make(
             Outcome::Warn,
-            "no STUN response — UDP likely blocked (harmless for the tunnel transport; \
-             matters for v2 WebRTC)"
+            "no STUN response — UDP likely blocked; b2p's relay transport (TCP/443) is \
+             unaffected"
                 .into(),
         ),
-    }
-}
-
-async fn rendezvous_check(tls: &TlsOpts, url: &str) -> Check {
-    let label = format!("rendezvous ({url})");
-    let make = |outcome, detail: String| Check {
-        name: "rendezvous",
-        label: label.clone(),
-        outcome,
-        detail,
-    };
-    let client = match crate::http::client(tls) {
-        Ok(c) => c,
-        Err(e) => return make(Outcome::Fail, format!("cannot build HTTPS client: {e:#}")),
-    };
-    match client.get(url).timeout(CHECK_TIMEOUT).send().await {
-        Ok(r) if r.status().is_success() => make(
-            Outcome::Ok,
-            format!("HTTP {} — reachable", r.status().as_u16()),
-        ),
-        Ok(r) => make(
-            Outcome::Warn,
-            format!("unexpected HTTP {}", r.status().as_u16()),
-        ),
-        Err(e) => make(Outcome::Fail, format!("unreachable: {e:#}")),
     }
 }
 
@@ -300,9 +287,8 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
     };
     if failed("dns") {
         return format!(
-            "this network blocks {target} at the DNS layer — the tunnel transport cannot \
-             work here; try `b2p receive --direct` with both machines on the same LAN, or \
-             run the receiver on a less restricted network"
+            "this network blocks {target} at the DNS layer — the relay cannot be reached \
+             by name here; try another network, or a relay on a domain this network resolves"
         );
     }
     if failed("tls") {
@@ -311,19 +297,13 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
             .into();
     }
     if failed("relay") {
-        return "the relay is unreachable — default transfers cannot proceed; check the URL \
-                (b2p relay show) and that the worker is deployed (npx wrangler deploy in \
-                relay-worker/)"
+        return "the relay is unreachable — transfers cannot proceed; check the URL \
+                (b2p relay show) and that the relay is up (Worker: npx wrangler deploy in \
+                relay-worker/; self-hosted: b2p relay serve on the server)"
             .into();
     }
-    if failed("rendezvous") {
-        return "HTTPS egress looks restricted (the rendezvous host is unreachable) — \
-                transfers may still work if the tunnel host is reachable; otherwise use \
-                --direct on a shared LAN"
-            .into();
-    }
-    // A symmetric NAT passes every layer above yet breaks direct WebRTC — the
-    // one case where "no blockers found" would be a false all-clear.
+    // A symmetric NAT is worth naming even when every check passes: it is why
+    // generic P2P tools fail on this network, and why b2p relays instead.
     if checks
         .iter()
         .any(|c| c.name == "stun" && c.outcome == Outcome::Warn && c.detail.contains("symmetric"))
@@ -332,15 +312,13 @@ pub fn verdict(checks: &[Check], target: &str) -> String {
             .iter()
             .any(|c| c.name == "relay" && c.outcome == Outcome::Ok)
         {
-            return "this network's NAT is symmetric — direct P2P (--p2p) would likely fail, \
-                    but the default relay transport is unaffected and reachable; transfers \
-                    should work"
+            return "this network's NAT is symmetric (hostile to direct P2P), but b2p's relay \
+                    transport is unaffected and the relay is reachable; transfers should work"
                 .into();
         }
-        return "every layer is clean, but this network's NAT is symmetric — direct WebRTC \
-                (--p2p) to another NAT'd peer will likely fail. The default relay transport is \
-                unaffected (configure one: b2p relay set); for P2P use a TURN relay (--turn), \
-                --tunnel, or put both peers on the same LAN"
+        return "this network's NAT is symmetric (hostile to direct P2P) — b2p's relay \
+                transport is unaffected; configure a relay (b2p relay set) and re-run doctor \
+                to probe it"
             .into();
     }
     "no blockers found — DNS, TLS, and HTTPS reachability look clean".into()
@@ -393,11 +371,10 @@ mod tests {
             check("dns", Outcome::Fail),
             check("tls", Outcome::Ok),
             check("stun", Outcome::Ok),
-            check("rendezvous", Outcome::Ok),
         ];
-        let v = verdict(&checks, "trycloudflare.com");
+        let v = verdict(&checks, "relay.example.com");
         assert!(v.contains("DNS"), "{v}");
-        assert!(v.contains("--direct"), "{v}");
+        assert!(v.contains("relay.example.com"), "{v}");
     }
 
     #[test]
@@ -406,30 +383,49 @@ mod tests {
             check("dns", Outcome::Ok),
             check("tls", Outcome::Fail),
             check("stun", Outcome::Ok),
-            check("rendezvous", Outcome::Ok),
         ];
         let v = verdict(&checks, "example.com");
         assert!(v.contains("--cafile"), "{v}");
     }
 
     #[test]
-    fn symmetric_nat_warns_in_verdict() {
-        let checks = vec![
-            check("dns", Outcome::Ok),
-            check("tls", Outcome::Ok),
-            Check {
-                name: "stun",
-                label: "UDP/STUN".into(),
-                outcome: Outcome::Warn,
-                detail: "UDP egress works, but this NAT is symmetric (mapped ports differ: \
-                         [3828, 29126])"
-                    .into(),
-            },
-            check("rendezvous", Outcome::Ok),
-        ];
-        let v = verdict(&checks, "example.com");
+    fn symmetric_nat_named_but_relay_unaffected() {
+        let symmetric = Check {
+            name: "stun",
+            label: "UDP/STUN".into(),
+            outcome: Outcome::Warn,
+            detail: "UDP egress works, but this NAT is symmetric (mapped ports differ: \
+                     [3828, 29126])"
+                .into(),
+        };
+        // Without a relay probe: point at configuring one.
+        let v = verdict(
+            &[
+                check("dns", Outcome::Ok),
+                check("tls", Outcome::Ok),
+                symmetric,
+            ],
+            "example.com",
+        );
         assert!(v.contains("symmetric"), "{v}");
-        assert!(v.contains("--turn"), "{v}");
+        assert!(v.contains("relay set"), "{v}");
+        // With a reachable relay: transfers should work.
+        let symmetric = Check {
+            name: "stun",
+            label: "UDP/STUN".into(),
+            outcome: Outcome::Warn,
+            detail: "this NAT is symmetric".into(),
+        };
+        let v = verdict(
+            &[
+                check("dns", Outcome::Ok),
+                check("tls", Outcome::Ok),
+                symmetric,
+                check("relay", Outcome::Ok),
+            ],
+            "example.com",
+        );
+        assert!(v.contains("should work"), "{v}");
     }
 
     #[test]
@@ -438,10 +434,22 @@ mod tests {
             check("dns", Outcome::Ok),
             check("tls", Outcome::Ok),
             check("stun", Outcome::Ok),
-            check("rendezvous", Outcome::Ok),
         ];
         let v = verdict(&checks, "example.com");
         assert!(v.contains("no blockers"), "{v}");
+    }
+
+    #[test]
+    fn relay_host_extracted_from_ws_urls() {
+        assert_eq!(
+            relay_host("wss://b2p-relay.example.workers.dev").as_deref(),
+            Some("b2p-relay.example.workers.dev")
+        );
+        assert_eq!(
+            relay_host("ws://127.0.0.1:9009").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(relay_host("not a url"), None);
     }
 
     #[test]
@@ -469,21 +477,5 @@ mod tests {
             assert!(c.detail.contains("DNS"), "{}", c.detail);
             assert!(c.detail.contains("not"), "{}", c.detail);
         }
-    }
-
-    #[tokio::test]
-    async fn rendezvous_check_against_local_server() {
-        // any 200-returning local HTTP endpoint stands in for ntfy.sh
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let tls = crate::http::TlsOpts::default();
-        let c = rendezvous_check(&tls, &format!("http://{addr}/health")).await;
-        assert_eq!(c.outcome, Outcome::Ok, "{}", c.detail);
-        let c = rendezvous_check(&tls, &format!("http://{addr}/missing")).await;
-        assert_eq!(c.outcome, Outcome::Warn, "{}", c.detail);
     }
 }

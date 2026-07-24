@@ -55,7 +55,7 @@ enum Cmd {
     },
     /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
     Doctor {
-        /// A URL or hostname to test (default: a public canary domain)
+        /// A URL or hostname to test (default: the configured relay's host)
         target: Option<String>,
     },
     /// Configure the relay this machine uses by default.

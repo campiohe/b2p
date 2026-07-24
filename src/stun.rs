@@ -1,6 +1,7 @@
 //! Minimal STUN (RFC 5389) binding-request probe. Used only by `b2p doctor`
-//! to answer one question: does UDP egress to a public STUN server work?
-//! (That is what decides whether the v2 WebRTC transport will be viable.)
+//! to characterize the network: does UDP egress work, and how does the NAT
+//! map it? (b2p's relay transport never uses UDP — this explains why generic
+//! P2P tools fail on a network, and documents what b2p routes around.)
 
 use anyhow::Context;
 use rand::RngCore;
@@ -90,12 +91,12 @@ pub fn parse_xor_mapped_address(resp: &[u8], txn_id: &[u8; 12]) -> Option<Socket
     None
 }
 
-/// How this network's NAT maps one local socket to a public address — the thing
-/// that actually decides whether STUN-only WebRTC can work peer-to-peer.
+/// How this network's NAT maps one local socket to a public address — the
+/// thing that decides whether direct P2P protocols can work here at all.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NatMapping {
     /// ≥2 servers answered with the SAME mapped port — endpoint-independent
-    /// (cone) NAT or open internet; direct WebRTC is viable.
+    /// (cone) NAT or open internet; P2P-friendly.
     EndpointIndependent(SocketAddr),
     /// ≥2 servers answered with DIFFERENT mapped addresses (IP or port) —
     /// symmetric NAT; a reflexive candidate points at an endpoint the peer

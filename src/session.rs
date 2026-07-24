@@ -29,7 +29,7 @@ impl std::fmt::Display for EstablishError {
         // full "context: cause: cause" chain into this Display's own output,
         // so it survives being re-boxed into a new `anyhow::Error` by the
         // `?`/`From` conversion below — otherwise the cause chain (e.g. the
-        // underlying reqwest error) would silently disappear from whatever
+        // underlying transport error) would silently disappear from whatever
         // prints `e` afterwards, regardless of `{}` vs `{:#}` there.
         write!(f, "{:#}", self.0)
     }
