@@ -1,9 +1,6 @@
 use anyhow::{bail, Context};
-use b2p::code::Code;
-use b2p::crypto::Secret;
 use b2p::http::TlsOpts;
-use b2p::server::{AcceptRequest, Event, ServerCfg};
-use b2p::{archive, progress, send, server, tunnel};
+use b2p::{archive, progress};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,25 +24,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for a transfer through the relay (default) or tunnel.
+    /// Wait for a transfer through the relay.
     Receive {
         /// Output directory (default: current directory)
         #[arg(long, default_value = ".")]
         out: PathBuf,
-        /// Skip the tunnel and serve directly on the LAN (--tunnel only)
-        #[arg(long, requires = "tunnel")]
-        direct: bool,
         /// Accept the incoming transfer without prompting
         #[arg(long)]
         yes: bool,
         /// Overwrite existing files without warning
         #[arg(long)]
         overwrite: bool,
-        /// Use the v1 Cloudflare tunnel instead of the relay
-        #[arg(long)]
-        tunnel: bool,
         /// Relay URL override (default: config / B2P_RELAY)
-        #[arg(long, conflicts_with = "tunnel")]
+        #[arg(long)]
         relay: Option<String>,
     },
     /// Send files, folders, or text to a waiting receiver.
@@ -64,7 +55,7 @@ enum Cmd {
     },
     /// Diagnose this network: DNS filtering, TLS inspection, UDP/STUN.
     Doctor {
-        /// A b2p code, URL, or hostname to test (default: the tunnel domain)
+        /// A URL or hostname to test (default: a public canary domain)
         target: Option<String>,
     },
     /// Configure the relay this machine uses by default.
@@ -120,18 +111,10 @@ async fn run() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Receive {
             out,
-            direct,
             yes,
             overwrite,
-            tunnel,
             relay,
-        } => {
-            if tunnel {
-                receive_tunnel(out, direct, yes, overwrite, &tls).await
-            } else {
-                receive_relay_cli(out, yes, overwrite, relay, &tls).await
-            }
-        }
+        } => receive_relay_cli(out, yes, overwrite, relay, &tls).await,
         Cmd::Send {
             code,
             paths,
@@ -230,83 +213,6 @@ async fn run() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-async fn receive_tunnel(
-    out: PathBuf,
-    direct: bool,
-    yes: bool,
-    overwrite: bool,
-    tls: &TlsOpts,
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&out)?;
-    let secret = Secret::generate();
-    let mut handles = server::start(
-        ServerCfg {
-            secret: secret.clone(),
-            out_dir: out.clone(),
-            auto_accept: yes,
-            overwrite,
-        },
-        direct,
-    )
-    .await?;
-
-    let tunnel_handle = if direct {
-        tunnel::direct(handles.port)?
-    } else {
-        eprintln!("Opening tunnel...");
-        tunnel::start_cloudflared(handles.port, tls).await?
-    };
-
-    let code = Code::new(tunnel_handle.url.clone(), secret);
-    eprintln!("\nOn the other machine, run:\n");
-    println!("    b2p send '{code}' <files...>\n");
-    eprintln!("Waiting for the sender... (Ctrl-C to abort; partial data is kept)");
-
-    let mut bar: Option<indicatif::ProgressBar> = None;
-    loop {
-        tokio::select! {
-            Some(AcceptRequest { summary, reply }) = handles.accept_rx.recv() => {
-                eprintln!("\n{summary}");
-                eprint!("Accept? [y/N] ");
-                std::io::stderr().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let _ = reply.send(line.trim().eq_ignore_ascii_case("y"));
-            }
-            Some(ev) = handles.events_rx.recv() => match ev {
-                Event::Accepted { name, total_size } => {
-                    eprintln!("Receiving {name}...");
-                    bar = Some(progress::transfer_bar(total_size));
-                }
-                Event::Progress { bytes } => {
-                    if let Some(b) = &bar { b.inc(bytes); }
-                }
-                Event::Text(t) => {
-                    eprintln!("--- text snippet ---");
-                    println!("{t}");
-                }
-                Event::Done(desc) => {
-                    if let Some(b) = &bar { b.finish(); }
-                    eprintln!("Done: {desc}");
-                    break;
-                }
-                Event::Failed(msg) => {
-                    if let Some(b) = &bar { b.abandon(); }
-                    bail!("{msg}");
-                }
-            },
-            _ = handles.shutdown.cancelled() => break,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nAborted. Partial data kept — run `b2p receive` again to resume.");
-                handles.shutdown.cancel();
-                break;
-            }
-        }
-    }
-    drop(tunnel_handle);
-    Ok(())
 }
 
 /// Decide whether to accept an incoming transfer. `--yes` skips the prompt
@@ -466,17 +372,16 @@ async fn do_send(
     relay_flag: Option<String>,
     tls: &TlsOpts,
 ) -> anyhow::Result<()> {
-    // Classify/parse the code BEFORE `archive::prepare`, which can tar a
-    // large folder — an invalid code should fail fast, not after a long tar.
-    enum Dest {
-        Rendezvous(b2p::rvcode::RendezvousCode),
-        Tunnel(Code),
+    // Parse the code BEFORE `archive::prepare`, which can tar a large
+    // folder — an invalid code should fail fast, not after a long tar.
+    if !b2p::rvcode::is_rendezvous_code(&code) {
+        bail!(
+            "unrecognized code — expected the form `7-otter-zebra` or `b2p://…` as printed by \
+             `b2p receive` (v1 `https://…#…` tunnel codes are no longer supported; update b2p \
+             on both machines)"
+        );
     }
-    let dest = if b2p::rvcode::is_rendezvous_code(&code) {
-        Dest::Rendezvous(b2p::rvcode::parse(&code).context("invalid code")?)
-    } else {
-        Dest::Tunnel(Code::parse(&code).context("invalid code — paste it exactly as printed")?)
-    };
+    let rc = b2p::rvcode::parse(&code).context("invalid code")?;
 
     let source = match &text {
         Some(t) => archive::prepare_text(t),
@@ -485,66 +390,43 @@ async fn do_send(
             archive::prepare(&paths)?
         }
     };
-    match dest {
-        Dest::Rendezvous(rc) => {
-            // Default (P2b): send through the relay.
-            let cfg = b2p::config::load()?;
-            let relay = b2p::config::resolve_relay(
-                relay_flag.as_deref(),
-                rc.relay_host.as_deref(),
-                std::env::var("B2P_RELAY").ok().as_deref(),
-                std::env::var("B2P_RELAY_TOKEN").ok().as_deref(),
-                &cfg,
-            )?;
-            let bar = match &source {
-                archive::Source::Blob { total_size, .. } => {
-                    Some(progress::transfer_bar(*total_size))
-                }
-                archive::Source::Text { .. } => None,
-            };
-            eprintln!("Waiting for the receiver...");
-            let desc = match b2p::session::send_relay(
-                &relay.url,
-                relay.token.as_deref(),
-                &rc.topic,
-                &rc.secret.0,
-                &source,
-                tls,
-                CONNECT_TIMEOUT,
-                bar.clone(),
-            )
-            .await
-            {
-                Ok(d) => d,
-                Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
-                    return connect_failed_relay(e, &relay, tls).await
-                }
-                Err(e) => return Err(e),
-            };
-            if let Some(b) = bar {
-                b.finish();
-            }
-            eprintln!("via relay");
-            eprintln!("Done: {desc}");
-            Ok(())
+    let cfg = b2p::config::load()?;
+    let relay = b2p::config::resolve_relay(
+        relay_flag.as_deref(),
+        rc.relay_host.as_deref(),
+        std::env::var("B2P_RELAY").ok().as_deref(),
+        std::env::var("B2P_RELAY_TOKEN").ok().as_deref(),
+        &cfg,
+    )?;
+    let bar = match &source {
+        archive::Source::Blob { total_size, .. } => Some(progress::transfer_bar(*total_size)),
+        archive::Source::Text { .. } => None,
+    };
+    eprintln!("Waiting for the receiver...");
+    let desc = match b2p::session::send_relay(
+        &relay.url,
+        relay.token.as_deref(),
+        &rc.topic,
+        &rc.secret.0,
+        &source,
+        tls,
+        CONNECT_TIMEOUT,
+        bar.clone(),
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) if e.downcast_ref::<b2p::session::EstablishError>().is_some() => {
+            return connect_failed_relay(e, &relay, tls).await
         }
-        Dest::Tunnel(code) => {
-            // v1 tunnel code
-            let bar = match &source {
-                archive::Source::Blob { total_size, .. } => {
-                    Some(progress::transfer_bar(*total_size))
-                }
-                archive::Source::Text { .. } => None,
-            };
-            eprintln!("Waiting for the receiver to accept...");
-            let desc = send::send(&code, source, bar.clone(), tls).await?;
-            if let Some(b) = bar {
-                b.finish();
-            }
-            eprintln!("Done: {desc}");
-            Ok(())
-        }
+        Err(e) => return Err(e),
+    };
+    if let Some(b) = bar {
+        b.finish();
     }
+    eprintln!("via relay");
+    eprintln!("Done: {desc}");
+    Ok(())
 }
 
 /// Run on a relay establishment failure (design §6: dial/handshake only —
@@ -575,13 +457,7 @@ async fn connect_failed_relay(
 }
 
 fn parse_target(s: &str) -> anyhow::Result<String> {
-    let host = if s.contains('#') {
-        Code::parse(s)?
-            .base_url
-            .host_str()
-            .context("code URL has no host")?
-            .to_string()
-    } else if s.contains("://") {
+    let host = if s.contains("://") {
         url::Url::parse(s)
             .context("invalid URL")?
             .host_str()
@@ -598,16 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_target_accepts_code_url_and_host() {
-        let secret = b2p::crypto::Secret::generate();
-        let code = b2p::code::Code::new(
-            "https://tall-lion.trycloudflare.com".parse().unwrap(),
-            secret,
-        );
-        assert_eq!(
-            parse_target(&code.to_string()).unwrap(),
-            "tall-lion.trycloudflare.com"
-        );
+    fn parse_target_accepts_url_and_host() {
         assert_eq!(
             parse_target("https://example.com/x").unwrap(),
             "example.com"
@@ -617,8 +484,8 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_picks_transport_by_code_form() {
-        // human + b2p:// codes → rendezvous (P1); https:// → tunnel (P0)
+    fn send_accepts_only_relay_codes() {
+        // human + b2p:// codes are valid; v1 https:// tunnel codes are not
         assert!(b2p::rvcode::is_rendezvous_code("7-otter-zebra"));
         assert!(b2p::rvcode::is_rendezvous_code("b2p://topic#secret"));
         assert!(!b2p::rvcode::is_rendezvous_code(

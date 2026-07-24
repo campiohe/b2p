@@ -1,26 +1,41 @@
 //! Framed AEAD payload transfer over a reliable, ordered message channel
 //! (design §4.3). Frame sequence, sender → receiver:
 //!   1. manifest        (Domain::StreamToReceiver, index 0)
-//!   2. [receiver replies ManifestAck, Domain::StreamToSender, index 0]
+//!   2. [receiver replies StreamManifestAck, Domain::StreamToSender, index 0]
 //!   3. payload frames  (Domain::StreamToReceiver, index 1..=N)   — blobs only
 //!   4. commit (hash)   (Domain::StreamToReceiver, index N+1)
 //!   5. [receiver replies CommitAck, Domain::StreamToSender, index 1]
 //!
 //! Each direction has its own Domain so the shared stream key never reuses a
-//! nonce. The receiver stages into the existing `Store`, so blake3 verification
-//! and finalize/unpack are identical to the tunnel transport.
+//! nonce. The receiver stages into `Store`, which owns blake3 verification
+//! and finalize/unpack.
 
 use crate::archive::{unpack_tar, Source};
 use crate::crypto::{open, seal, Domain};
 use crate::pake::SessionKey;
 use crate::protocol::{Commit, CommitAck, Kind, Manifest, StreamManifestAck, PROTOCOL_VERSION};
-use crate::send::read_chunk;
 use crate::store::Store;
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// Read chunk `index` of a file split into `chunk_size` pieces; the last
+/// chunk is short. Bounds are the caller's contract (`index` in range).
+pub fn read_chunk(
+    path: &Path,
+    index: u64,
+    chunk_size: u64,
+    total_size: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(index * chunk_size))?;
+    let len = chunk_size.min(total_size - index * chunk_size) as usize;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
 
 /// Payload framing size. One frame + AEAD tag fits comfortably in a single
 /// SCTP data-channel message.
@@ -682,5 +697,16 @@ mod tests {
         let _ = send_source(&mut s, &SessionKey([7u8; 32]), &source, None).await;
         assert!(recv.await.unwrap().is_err());
         assert!(!out.path().join("f.bin").exists());
+    }
+
+    #[test]
+    fn read_chunk_full_and_short_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let data: Vec<u8> = (0..10u8).collect(); // 10 bytes, chunk_size 4 → 4+4+2
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(read_chunk(&path, 0, 4, 10).unwrap(), &data[0..4]);
+        assert_eq!(read_chunk(&path, 1, 4, 10).unwrap(), &data[4..8]);
+        assert_eq!(read_chunk(&path, 2, 4, 10).unwrap(), &data[8..10]);
     }
 }
