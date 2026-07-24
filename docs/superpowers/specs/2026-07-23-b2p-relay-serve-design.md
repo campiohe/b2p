@@ -91,16 +91,17 @@ TcpListener → [optional TLS accept (tokio-rustls)] → HTTP request head
 - **TLS:** when cert/key given, wrap accepted TCP in a `tokio-rustls`
   acceptor built with the ring provider (house rule: explicit provider,
   never bare `builder()`); rustls + rustls-pemfile are existing deps.
-- **healthz/routing (the one spike):** tungstenite's server handshake may
-  allow answering a plain `GET /healthz` from the `accept_hdr_async`
-  callback via its `ErrorResponse` (status 200, body `ok`); if the
-  handshake machinery rejects non-upgrade requests before the callback
-  runs, fall back to reading the request head first (`httparse`, a tiny
-  no-dependency crate) and handing upgrades to tungstenite through a small
-  prefix-replaying stream wrapper. A 10-minute spike BEFORE the plan picks
-  the mechanism; both are small and the choice is invisible externally.
-  k8s note: `/healthz` works for HTTP probes either way; `tcpSocket` probes
-  also fine.
+- **healthz/routing (SPIKE RESOLVED):** tungstenite rejects non-upgrade
+  requests before `accept_hdr_async`'s callback runs, so the server owns
+  the request head: read until `\r\n\r\n`, parse with `httparse` (the one
+  new dependency; zero transitive deps), answer `/healthz`/401/400/404
+  directly, and for genuine upgrades write the 101 itself
+  (`tungstenite::handshake::derive_accept_key`) then hand the socket to
+  `WebSocketStream::from_raw_socket` behind a small prefix-replaying
+  AsyncRead+AsyncWrite wrapper for any bytes read past the head. Verified
+  end-to-end in a spike: curl `/healthz` → `ok`, and a real
+  tokio-tungstenite client round-tripped 100 KB through the manual 101.
+  k8s note: `/healthz` works for HTTP probes; `tcpSocket` probes also fine.
 - **Isolation:** one tokio task per connection; a panic or slow peer in one
   room cannot affect others (same property the DO gives the Worker).
 - New dependencies: none required; possibly `httparse` (spike-dependent);
