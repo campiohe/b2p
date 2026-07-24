@@ -411,7 +411,12 @@ async fn run_room_conn<S>(
                         if overflow {
                             // Slow/hostile consumer: unregister it so no more
                             // frames queue; its own task reaps the socket.
+                            // The room is single-occupant again, so stamp
+                            // alone_since — otherwise the unpaired-expiry
+                            // sweeper never reaps this room and a flooder
+                            // could hold it indefinitely.
                             *state.slot_mut(role.other()) = None;
+                            state.alone_since = Some(Instant::now());
                             eprintln!("relay: room {room} {} overflowed; dropped", role.other().as_str());
                         }
                     }
@@ -909,18 +914,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flooding_a_stuck_peer_is_bounded_not_ooming() {
-        // A sender that floods a receiver which never reads must not make the
-        // server buffer without bound: the receiver's slot overflows and is
-        // dropped, and the flooder's forwards stop finding a peer. The test's
-        // proof is that the server stays responsive (a fresh room still
-        // pairs) rather than hanging/OOMing.
-        let srv = spawn_server(ServeCfg::default()).await;
+    async fn flooding_a_stuck_peer_evicts_it_bounding_memory() {
+        // A sender flooding a receiver that never reads must overflow the
+        // receiver's bounded queue and EVICT it (not buffer without bound).
+        // Proof that eviction happens — and what distinguishes bounded from
+        // the old unbounded channel: once evicted, the room is
+        // single-occupant, so the unpaired-expiry sweeper reaps the flooder
+        // with a 1013. Under an unbounded queue the victim is never evicted,
+        // the room stays paired, and this 1013 never arrives (the test hangs
+        // → fails).
+        let srv = spawn_server(ServeCfg {
+            expire_unpaired: std::time::Duration::from_millis(300),
+            sweep_every: std::time::Duration::from_millis(100),
+            ..Default::default()
+        })
+        .await;
         let mut victim = ws_client(srv.addr, "flood", "recv").await;
         let mut flooder = ws_client(srv.addr, "flood", "send").await;
         let _ = next_text(&mut victim).await;
         let _ = next_text(&mut flooder).await;
-        // Victim never reads again. Flood well past the 24-slot queue.
+        // Victim never reads again. Flood past the 24-slot queue (eviction
+        // happens within ~25 messages; the rest find no peer, dropped).
         for _ in 0..200 {
             if flooder
                 .send(Message::Binary(vec![0u8; 900 * 1024].into()))
@@ -930,24 +944,24 @@ mod tests {
                 break;
             }
         }
-        drop(victim);
-        // The server is still healthy: a brand-new room pairs and forwards.
-        let mut r2 = ws_client(srv.addr, "healthy", "recv").await;
-        let mut s2 = ws_client(srv.addr, "healthy", "send").await;
-        assert_eq!(next_text(&mut r2).await, r#"{"t":"peer-joined"}"#);
-        assert_eq!(next_text(&mut s2).await, r#"{"t":"peer-joined"}"#);
-        s2.send(Message::Binary(vec![1, 2, 3].into()))
-            .await
-            .unwrap();
-        loop {
-            match r2.next().await.unwrap().unwrap() {
-                Message::Binary(b) => {
-                    assert_eq!(b.as_ref(), &[1, 2, 3]);
-                    break;
+        // The flooder — now alone in the room — is reaped by expiry (1013).
+        let code = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match flooder.next().await {
+                    Some(Ok(Message::Close(f))) => break f.map(|f| u16::from(f.code)),
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => break None,
                 }
-                _ => continue,
             }
-        }
+        })
+        .await
+        .expect("flooder must be reaped after its peer is evicted");
+        assert_eq!(
+            code,
+            Some(1013),
+            "expected unpaired-expiry close of the lone flooder"
+        );
+        drop(victim);
     }
 
     #[tokio::test]

@@ -34,6 +34,13 @@ spec phase they belong to. See `b2p-v2-spec.md` and
 - [ ] Metrics endpoint / rate limiting — only with real demand.
 - [ ] Standalone protocol document if third-party relay implementations
       appear.
+- [ ] Prompt reaping of a send-parked connection: a task blocked in
+      `sink.send().await` on a backpressured (half-open) socket doesn't
+      observe the graceful-shutdown signal or its slot removal until the OS
+      TCP write finally errors (possibly minutes), pinning its semaphore
+      permit + bounded queue. Memory is already bounded (the DoS fix holds);
+      this is a liveness nicety — wrap the outbound send in a timeout if a
+      public relay ever needs prompt shutdown of wedged clients.
 
 ### P2b deferred follow-ups
 
