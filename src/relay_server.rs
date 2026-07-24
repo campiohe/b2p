@@ -108,8 +108,42 @@ impl Drop for RelayServer {
     }
 }
 
+fn tls_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(cert_path)
+            .with_context(|| format!("opening {}", cert_path.display()))?,
+    ))
+    .collect::<Result<_, _>>()
+    .context("parsing TLS certificates")?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "no certificates in {}",
+        cert_path.display()
+    );
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(key_path).with_context(|| format!("opening {}", key_path.display()))?,
+    ))
+    .context("parsing TLS key")?
+    .context("no private key found")?;
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("TLS protocol setup")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("building TLS config")?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
+}
+
 pub async fn start(cfg: ServeCfg) -> anyhow::Result<RelayServer> {
-    anyhow::ensure!(cfg.tls.is_none(), "TLS not yet wired (Task 5)");
+    let acceptor = match &cfg.tls {
+        Some((cert, key)) => Some(tls_acceptor(cert, key)?),
+        None => None,
+    };
     let listener = TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("binding {}", cfg.listen))?;
@@ -135,9 +169,16 @@ pub async fn start(cfg: ServeCfg) -> anyhow::Result<RelayServer> {
                     let Ok((stream, peer)) = accepted else { return };
                     let rooms = rooms.clone();
                     let token = token.clone();
+                    let acceptor = acceptor.clone();
                     let id = conn_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
-                        handle_conn(stream, rooms, token, id, peer).await;
+                        match acceptor {
+                            Some(a) => match a.accept(stream).await {
+                                Ok(tls) => handle_conn(tls, rooms, token, id, peer).await,
+                                Err(e) => eprintln!("relay: TLS handshake from {peer} failed: {e}"),
+                            },
+                            None => handle_conn(stream, rooms, token, id, peer).await,
+                        }
                     });
                 }
             }
@@ -761,6 +802,53 @@ mod tests {
         })
         .await;
         assert!(died.is_ok(), "sender socket should be closed");
+    }
+
+    #[tokio::test]
+    async fn tls_serves_wss_end_to_end() {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("cert");
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+
+        let srv = spawn_server(ServeCfg {
+            tls: Some((cert_path.clone(), key_path)),
+            ..Default::default()
+        })
+        .await;
+        // full client stack through TLS: RelayChannel with --cafile trust
+        let tls = crate::http::TlsOpts {
+            cafile: Some(cert_path),
+        };
+        let url = format!("wss://127.0.0.1:{}", srv.addr.port());
+        let (r, s) = tokio::join!(
+            crate::transport::relay::connect(
+                &url,
+                "roomTls",
+                crate::pake::Role::Receiver,
+                None,
+                &tls,
+                std::time::Duration::from_secs(10)
+            ),
+            crate::transport::relay::connect(
+                &url,
+                "roomTls",
+                crate::pake::Role::Sender,
+                None,
+                &tls,
+                std::time::Duration::from_secs(10)
+            )
+        );
+        use crate::stream::MsgChannel;
+        let (mut r, mut s) = (r.unwrap(), s.unwrap());
+        s.send(b"over tls").await.unwrap();
+        assert_eq!(r.recv().await.unwrap(), b"over tls");
     }
 
     #[tokio::test]
